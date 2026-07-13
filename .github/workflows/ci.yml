@@ -1,0 +1,137 @@
+name: Distribution CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: distribution-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - "20"
+          - "22"
+
+    steps:
+      - name: Check out the reviewed tree
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Run doctor tests
+        run: npm test
+
+      - name: Validate executable syntax and package contents
+        run: |
+          node --check bin/quriov-mcp-doctor.mjs
+          npm pack --dry-run
+
+      - name: Fail closed on contract drift or secret-like content
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash } from "node:crypto";
+          import { execFileSync } from "node:child_process";
+          import { readFile } from "node:fs/promises";
+
+          const endpoint = "https://quriovai.com/mcp/v1";
+          const tools = [
+            "cancel_generation",
+            "check_generation",
+            "estimate_cost",
+            "generate_image",
+            "generate_video",
+            "get_account",
+            "list_capabilities",
+            "list_generations",
+          ];
+          const manifest = JSON.parse(await readFile("install-manifest.json", "utf8"));
+          const contract = JSON.parse(await readFile("contract.lock.json", "utf8"));
+
+          if (manifest.endpoint !== endpoint || manifest.scope !== "mcp") {
+            throw new Error("installation endpoint or scope drifted");
+          }
+          if (
+            manifest.allowedNetworkTargets.length !== 1 ||
+            manifest.allowedNetworkTargets[0] !== endpoint
+          ) {
+            throw new Error("installation network allowlist drifted");
+          }
+          if (contract.endpoint !== endpoint || contract.scope !== "mcp") {
+            throw new Error("public contract endpoint or scope drifted");
+          }
+          if (JSON.stringify(contract.tools) !== JSON.stringify(tools)) {
+            throw new Error("public tool contract must remain exactly eight tools");
+          }
+          if (contract.authoritative !== false || contract.publicFieldsOnly !== true) {
+            throw new Error("public contract boundary drifted");
+          }
+
+          for (const [path, expected] of Object.entries(manifest.files)) {
+            const actual = createHash("sha256")
+              .update(await readFile(path))
+              .digest("hex");
+            if (actual !== expected) {
+              throw new Error(`${path} hash drifted: update only in a reviewed release`);
+            }
+          }
+
+          const tracked = execFileSync("git", ["ls-files"], { encoding: "utf8" })
+            .trim()
+            .split(/\r?\n/)
+            .filter(Boolean);
+          const forbiddenPaths = [
+            /(^|\/)\.env($|\.)/i,
+            /(^|\/)(deployment|infrastructure|ops|providers?|server)(\/|$)/i,
+          ];
+          for (const path of tracked) {
+            if (forbiddenPaths.some((pattern) => pattern.test(path))) {
+              throw new Error(`forbidden distribution path: ${path}`);
+            }
+          }
+
+          const secretPatterns = [
+            /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
+            /\bsk-[A-Za-z0-9_-]{16,}\b/,
+            /\bqv_[A-Za-z0-9_-]{16,}\b/i,
+            /\bBearer\s+[A-Za-z0-9._-]{16,}\b/i,
+          ];
+          for (const path of tracked) {
+            const text = await readFile(path, "utf8").catch(() => "");
+            if (secretPatterns.some((pattern) => pattern.test(text))) {
+              throw new Error(`secret-like content detected in ${path}`);
+            }
+            if (/raw\.githubusercontent\.com\/[^\s]+\/main\//i.test(text)) {
+              throw new Error(`mutable raw GitHub reference detected in ${path}`);
+            }
+          }
+
+          for (const recipe of [
+            "recipes/codex.md",
+            "recipes/claude-code.md",
+            "recipes/cursor.md",
+          ]) {
+            const text = await readFile(recipe, "utf8");
+            if (!text.includes("RELEASE_COMMIT") || !text.includes("MANIFEST_SHA256")) {
+              throw new Error(`${recipe} does not require immutable prompt pins`);
+            }
+          }
+
+          console.log(`validated ${tracked.length} tracked files and ${tools.length} tools`);
+          NODE

@@ -61,10 +61,31 @@ Primary sources:
 
 - [`AGENTS.md`](AGENTS.md): safety and contribution contract for agents.
 - [`llms.txt`](llms.txt): compact machine-readable index.
-- `recipes/`: per-client install, verify, and uninstall instructions (added in
-  the next reviewed change).
-- `bin/quriov-mcp-doctor.mjs`: read-only protocol doctor (added with tests in a
-  later reviewed change).
+- [`recipes/codex.md`](recipes/codex.md): pinned Codex install, verify, and
+  uninstall recipe.
+- [`recipes/claude-code.md`](recipes/claude-code.md): pinned Claude Code
+  install, verify, and uninstall recipe.
+- [`recipes/cursor.md`](recipes/cursor.md): Cursor AI-assisted configuration;
+  automatic installation remains `unverified`.
+- [`install-manifest.json`](install-manifest.json): release contract and
+  SHA-256 locks for every install input.
+- [`contract.lock.json`](contract.lock.json): non-authoritative public snapshot
+  of the fixed endpoint and exact eight-tool contract.
+- [`bin/quriov-mcp-doctor.mjs`](bin/quriov-mcp-doctor.mjs): read-only protocol
+  doctor, covered by Node tests.
+- [`SECURITY.md`](SECURITY.md): private reporting path and threat model.
+
+After checking out the commit or tag supplied by the Quriov website and
+verifying the supplied manifest hash, run the doctor without putting the key
+in a command-line argument:
+
+```text
+node bin/quriov-mcp-doctor.mjs --key-stdin
+```
+
+The doctor reports only stage status, the exact tool count, and a redacted
+`get_account` result. It does not install, modify configuration, generate,
+spend credit, or revoke a key.
 
 ## License
 
