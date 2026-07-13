@@ -6,6 +6,31 @@ README.md
 AGENTS.md
   Mandatory safety, scope, secret-handling, immutability, and verification rules.
 
+install-manifest.json
+  Release metadata, allowed endpoint, client support levels, and SHA-256 locks.
+
+contract.lock.json
+  Non-authoritative snapshot of the fixed scope, endpoint, Registry identity,
+  and exact eight-tool public contract.
+
+recipes/codex.md
+  Codex trusted-agent install, verify, doctor, uninstall, and revoke procedure.
+
+recipes/claude-code.md
+  Claude Code trusted-agent install, verify, doctor, uninstall, and revoke procedure.
+
+recipes/cursor.md
+  Cursor AI-assisted setup and cleanup. Automatic installation is unverified.
+
+bin/quriov-mcp-doctor.mjs
+  Read-only initialize, exact tools/list, and redacted get_account validation.
+
+test/quriov-mcp-doctor.test.mjs
+  Doctor protocol, redaction, fail-closed, and argument-safety tests.
+
+SECURITY.md
+  Private vulnerability reporting route and public distribution threat model.
+
 https://quriovai.com/mcp
   Human-facing capability, key creation, revoke, and onboarding page.
 
