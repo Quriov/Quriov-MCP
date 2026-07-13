@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "authoritative": false,
+  "generatedAt": "2026-07-14",
+  "source": {
+    "repository": "https://github.com/Quriov/Quriov-AI-Video",
+    "commit": "fdb7fe3628f58f46e3603163dcbe6e782c066212",
+    "runtimeContract": "backend/src/quriov/mcp_server/canonical_contract.py",
+    "registryMetadata": "server.json"
+  },
+  "registry": {
+    "serverName": "com.quriovai/quriov",
+    "version": "1.0.0"
+  },
+  "endpoint": "https://quriovai.com/mcp/v1",
+  "scope": "mcp",
+  "tools": [
+    "cancel_generation",
+    "check_generation",
+    "estimate_cost",
+    "generate_image",
+    "generate_video",
+    "get_account",
+    "list_capabilities",
+    "list_generations"
+  ],
+  "publicFieldsOnly": true,
+  "containsPricing": false,
+  "containsProviderRouting": false,
+  "containsPrivateRegistryDocument": false
+}

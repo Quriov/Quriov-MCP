@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "distributionVersion": "1.0.0",
+  "repository": "https://github.com/Quriov/quriov-mcp",
+  "releaseTag": "v1.0.0",
+  "commitPinSource": "website_prompt",
+  "manifestHashAlgorithm": "sha256",
+  "manifestHashSource": "website_prompt",
+  "endpoint": "https://quriovai.com/mcp/v1",
+  "scope": "mcp",
+  "allowedNetworkTargets": [
+    "https://quriovai.com/mcp/v1"
+  ],
+  "doctor": {
+    "entrypoint": "bin/quriov-mcp-doctor.mjs",
+    "minimumNodeVersion": "20",
+    "credentialInputs": [
+      "stdin",
+      "QURIOV_MCP_ACCESS_KEY"
+    ],
+    "writesConfiguration": false
+  },
+  "clients": {
+    "codex": {
+      "recipe": "recipes/codex.md",
+      "support": "trusted_agent_install",
+      "userScopeConfiguration": "~/.codex/config.toml"
+    },
+    "claudeCode": {
+      "recipe": "recipes/claude-code.md",
+      "support": "trusted_agent_install",
+      "userScopeConfiguration": "~/.claude.json"
+    },
+    "cursor": {
+      "recipe": "recipes/cursor.md",
+      "support": "ai_assisted_unverified",
+      "userScopeConfiguration": "~/.cursor/mcp.json"
+    }
+  },
+  "files": {
+    "AGENTS.md": "c65aa1f6ee23f5114bffefc5db757fed093e732405ffa8fbc5432f00bdb6c1a7",
+    "recipes/codex.md": "8ebdd948621a4a5f8f6f7b60ace67bb5e45861e41095e2cf8183392d652aa7c7",
+    "recipes/claude-code.md": "b3d474191a4713359b04c180ad5d4eaf696090781bf5a91c769553a21e6cd304",
+    "recipes/cursor.md": "d2d86fefb18c6b2b79213f60db91d693be10b911e764e09c0f2caf316977fe09",
+    "bin/quriov-mcp-doctor.mjs": "d1b21cfacaf83f4cb1277d5d70a702a315543e8edbc147745c8470c4d11c6d41"
+  }
+}
