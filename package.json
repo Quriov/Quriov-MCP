@@ -1,0 +1,17 @@
+{
+  "name": "quriov-mcp-distribution",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned recipes and a read-only doctor for the Quriov remote MCP",
+  "type": "module",
+  "bin": {
+    "quriov-mcp-doctor": "./bin/quriov-mcp-doctor.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
