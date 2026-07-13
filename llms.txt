@@ -1,0 +1,13 @@
+# Quriov MCP installation and validation index
+
+README.md
+  Human overview, capability matrix, security notice, and fixed public contract.
+
+AGENTS.md
+  Mandatory safety, scope, secret-handling, immutability, and verification rules.
+
+https://quriovai.com/mcp
+  Human-facing capability, key creation, revoke, and onboarding page.
+
+https://quriovai.com/mcp/v1
+  The only allowed remote MCP endpoint. Requires a revocable scope=mcp key.
