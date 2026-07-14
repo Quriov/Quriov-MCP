@@ -1,6 +1,6 @@
 # Quriov MCP
 
-Official installation and validation recipes for the Quriov remote MCP.
+Official installation and validation recipes for Quriov MCP.
 
 Quriov MCP lets a trusted coding agent inspect the available image and video
 generation capabilities, estimate a job, generate media after confirmation,

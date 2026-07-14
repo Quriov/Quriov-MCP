@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please use the private
-[GitHub Security Advisory form](https://github.com/Quriov/quriov-mcp/security/advisories/new)
+[GitHub Security Advisory form](https://github.com/Quriov/Quriov-MCP/security/advisories/new)
 for suspected vulnerabilities. Do not open a public issue for a security
 report, and never include an access key, credential, account response, or
 private configuration in a report.

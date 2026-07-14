@@ -10,7 +10,7 @@ machine, so this recipe must not claim an automatic install.
 
 ## Inputs supplied by the Quriov website
 
-- `RELEASE_COMMIT`: immutable commit in `Quriov/quriov-mcp`.
+- `RELEASE_COMMIT`: immutable commit in `Quriov/Quriov-MCP`.
 - `MANIFEST_SHA256`: expected SHA-256 of `install-manifest.json` at that commit.
 - `QURIOV_MCP_KEY`: dedicated revocable `scope=mcp` key.
 
@@ -20,7 +20,7 @@ issue, or process argument.
 
 ## Assist the user
 
-1. Fetch `Quriov/quriov-mcp` at exactly `RELEASE_COMMIT`. Do not use `main` or
+1. Fetch `Quriov/Quriov-MCP` at exactly `RELEASE_COMMIT`. Do not use `main` or
    another mutable ref.
 2. Hash `install-manifest.json` and stop unless it equals `MANIFEST_SHA256`.
 3. Read `AGENTS.md`, this recipe, and the manifest before changing client state.
