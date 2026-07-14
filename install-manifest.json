@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "distributionVersion": "1.0.0",
-  "repository": "https://github.com/Quriov/quriov-mcp",
-  "releaseTag": "v1.0.0",
+  "distributionVersion": "1.0.1",
+  "repository": "https://github.com/Quriov/Quriov-MCP",
+  "releaseTag": "v1.0.1",
   "commitPinSource": "website_prompt",
   "manifestHashAlgorithm": "sha256",
   "manifestHashSource": "website_prompt",
@@ -39,9 +39,9 @@
   },
   "files": {
     "AGENTS.md": "c65aa1f6ee23f5114bffefc5db757fed093e732405ffa8fbc5432f00bdb6c1a7",
-    "recipes/codex.md": "8ebdd948621a4a5f8f6f7b60ace67bb5e45861e41095e2cf8183392d652aa7c7",
-    "recipes/claude-code.md": "b3d474191a4713359b04c180ad5d4eaf696090781bf5a91c769553a21e6cd304",
-    "recipes/cursor.md": "d2d86fefb18c6b2b79213f60db91d693be10b911e764e09c0f2caf316977fe09",
+    "recipes/codex.md": "fffa137890471d327e2791162fbc67dae518a4b571cf709177320f0b4a3e22e1",
+    "recipes/claude-code.md": "f317b1a8f30ea6d4f789c79fd7681a2b791a2fdf3952eb7e0d6b8efc56a963be",
+    "recipes/cursor.md": "a48685a7ef1c729d3f128489a59773b44795baf676c1459c167be9c785e9db76",
     "bin/quriov-mcp-doctor.mjs": "d1b21cfacaf83f4cb1277d5d70a702a315543e8edbc147745c8470c4d11c6d41"
   }
 }
