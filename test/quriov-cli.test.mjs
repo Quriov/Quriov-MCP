@@ -10,13 +10,13 @@ import {
   KEY_ENV_NAMES,
   MCP_ENDPOINT,
   QuriovClient,
-  RequestBudget,
   UPLOAD_ENDPOINT,
   loadSpec,
   main,
   parseArgv,
   parseCsv,
   requireKey,
+  resolveKeys,
   resolveKey,
   safeName,
   sumCredits,
@@ -279,7 +279,7 @@ test("钥匙不能写在命令参数里", () => {
   assert.throws(() => parseArgv(["--bogus"]), (e) => e.code === "usage");
 });
 
-test("钥匙：正式名字 QURIOV_API_KEY 优先，三个旧名字照认，最后才看 setup 保存的文件", () => {
+test("钥匙：四个环境变量名都认；都没有才看 setup 保存的文件", () => {
   assert.deepEqual(KEY_ENV_NAMES, ["QURIOV_API_KEY", "QURIOV_MCP_ACCESS_KEY", "QURIOV_MCP_KEY", "QURIOV_ACCESS_KEY"]);
   assert.equal(resolveKey({ env: { QURIOV_API_KEY: "new", QURIOV_MCP_ACCESS_KEY: "a" }, readFile: () => "" }).key, "new");
   const noFile = () => {
@@ -462,21 +462,6 @@ test("batch run：自动上传、提交、轮询、下载到 out/货号/图位.p
   assert.ok(stderr.includes(`→ ${join(out, "B002", "scene.png")}`), stderr);
 });
 
-test("控速：服务端每分钟上限内自动排队（每次工具调用算 2 次）", async () => {
-  const clock = fakeClock();
-  const budget = new RequestBudget({ perMinute: 4, now: clock.now, sleep: clock.sleep });
-  await budget.take(2);
-  await budget.take(2);
-  assert.equal(clock.slept.length, 0);
-  await budget.take(2);
-  assert.equal(clock.slept.length, 1);
-  assert.ok(clock.slept[0] >= 59_000);
-});
-
-// ---------------------------------------------------------------------------
-// 断点续跑
-// ---------------------------------------------------------------------------
-
 test("resume：中断后接着跑，已提交的不重复提交，崩在「已发出、待确认」的用原编号重交，不重复扣钱", async () => {
   const dir = workspace();
   const server = createServer({ pollsUntilDone: 1 });
@@ -584,83 +569,69 @@ test("resume --retry-failed：失败的换新编号重交，成功的不动", as
 // 报错要说清真实原因
 // ---------------------------------------------------------------------------
 
-test("第一次就 401：说清是钥匙问题的三种可能，包括用途选错", async () => {
+test("401：只当钥匙问题，带上服务端的中文原因和请求编号，不重试、不等", async () => {
   const dir = workspace();
-  const server = createServer({ onHttp: () => new Response('{"error":"invalid_token"}', { status: 401 }) });
-  const { error } = await run(["account"], { dir, server });
+  let calls = 0;
+  const server = createServer({
+    onHttp: () => {
+      calls += 1;
+      return new Response(JSON.stringify({ detail: "钥匙已过期。请到网页新建一把。", code: "access_key_expired", request_id: "req-401-abc" }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const { error, clock } = await run(["account"], { dir, server });
   assert.equal(error.code, "unauthorized");
-  assert.match(error.message, /撤销/);
-  assert.match(error.message, /API 调用/);
+  assert.match(error.message, /钥匙已过期。请到网页新建一把。/);
+  assert.match(error.message, /请求编号 req-401-abc/);
+  assert.match(error.message, /正在用环境变量 QURIOV_MCP_ACCESS_KEY 的钥匙/);
+  assert.doesNotMatch(error.message, /API 调用|限流/);
   assert.ok(!error.message.includes(TEST_KEY));
+  assert.equal(calls, 1, "401 不重试");
+  assert.deepEqual(clock.slept, [], "401 不等");
 });
 
-test("用着用着 401：按限流处理，等一分钟自动重试", async () => {
+test("503：按 Retry-After 等了再试；别的 5xx 不重试，报请求编号", async () => {
   const dir = workspace();
-  let failOnce = true;
+  let failures = 1;
   const server = createServer({
     onHttp: (url, init) => {
       const body = typeof init.body === "string" ? JSON.parse(init.body) : null;
-      if (body?.params?.name === "get_account" && failOnce) {
-        failOnce = false;
-        return new Response('{"error":"invalid_token"}', { status: 401 });
+      if (body?.params?.name === "get_account" && failures > 0) {
+        failures -= 1;
+        return new Response("{}", { status: 503, headers: { "retry-after": "7" } });
       }
       return undefined;
     },
   });
-  const { code, error, stderr, clock } = await run(["account"], { dir, server });
-  assert.equal(error, null, String(error?.message));
-  assert.equal(code, 0);
-  assert.match(stderr, /请求太密被限流/);
-  assert.ok(clock.slept.includes(65_000));
+  const ok = await run(["account"], { dir, server });
+  assert.equal(ok.error, null, String(ok.error?.message));
+  assert.equal(ok.code, 0);
+  assert.ok(ok.clock.slept.includes(7_000));
+
+  let calls = 0;
+  const broken = createServer({
+    onHttp: () => {
+      calls += 1;
+      return new Response(JSON.stringify({ detail: "internal server error", request_id: "req-500-xyz" }), { status: 500 });
+    },
+  });
+  const bad = await run(["account"], { dir, server: broken });
+  assert.equal(bad.error.code, "server_error");
+  assert.match(bad.error.message, /请求编号 req-500-xyz/);
+  assert.equal(calls, 1, "500 不重试");
 });
 
-test("限流（工具返回 rate_limited、等 60 秒）自动等待重试", async () => {
+test("account：服务端不再返回额度（quota: null）时不显示额度那行", async () => {
   const dir = workspace();
-  let limited = true;
   const server = createServer({
-    onTool: (name) => {
-      if (name === "get_account" && limited) {
-        limited = false;
-        return toolError("rate_limited", { retryable: true, retry_after_seconds: 60 });
-      }
-      return undefined;
-    },
+    onTool: (name) => (name === "get_account" ? { structuredContent: { balance: "12.5", wallet_type: "personal", quota: null }, isError: false } : undefined),
   });
-  const { code, stderr, clock } = await run(["account"], { dir, server });
+  const { code, stdout } = await run(["account"], { dir, server });
   assert.equal(code, 0);
-  assert.match(stderr, /60 秒后自动重试/);
-  assert.ok(clock.slept.includes(60_000));
-});
-
-test("今天的提交次数用完：暂停、已提交的照常收尾、没提交的留着明天续跑，返回 4", async () => {
-  const dir = workspace();
-  let submits = 0;
-  const server = createServer({
-    onTool: (name) => {
-      if (name === "generate_image") {
-        submits += 1;
-        if (submits > 1) return toolError("rate_limited", { retryable: true, retry_after_seconds: 50_000 });
-      }
-      return undefined;
-    },
-  });
-  const out = join(dir, "out");
-  const { code, error, stdout } = await run(["batch", "run", writeCsv(dir, TWO_BY_TWO), "-m", "gpt-image-2.5-2K", "-o", out, "--yes"], {
-    dir,
-    server,
-  });
-  assert.equal(error, null, String(error?.message));
-  assert.equal(code, 4);
-  assert.match(stdout, /今天的提交次数用完了/);
-  assert.match(stdout, /quriov batch resume/);
-  assert.ok(existsSync(join(out, "A001", "main_image.png")), "已提交的那张照常下载");
-  const state = JSON.parse(readFileSync(join(out, ".quriov", stateFiles(join(out, ".quriov"))[0]), "utf8"));
-  assert.deepEqual(
-    state.jobs.map((j) => j.status),
-    ["done", "pending", "pending", "pending"],
-  );
-  assert.equal(state.jobs[1].idempotencyKey, null, "被挡在记账之前的，编号作废，明天重来");
-  assert.ok(state.pausedUntil);
+  assert.match(stdout, /余额：12.5 点/);
+  assert.doesNotMatch(stdout, /还能提交|null/);
 });
 
 test("被网站防火墙拦（Cloudflare 1010）：明说不是钥匙问题", async () => {
@@ -990,4 +961,145 @@ test("gen：一次出 2 张带参考图，文件和花费清单落到输出目�
   assert.equal(files.filter((f) => f.endsWith(".png")).length, 2);
   const costFile = files.find((f) => f.startsWith("cost-") && f.endsWith(".csv"));
   assert.match(readFileSync(join(out, costFile), "utf8"), /gen,image,,gpt-image-2.5-2K,2,2,0.10,settled,完成/);
+});
+
+// ---------------------------------------------------------------------------
+// 钥匙从哪来（宇通 09-28 实撞：shell 里的旧环境变量 QURIOV_ACCESS_KEY 盖掉了刚 login 存下的钥匙）
+// ---------------------------------------------------------------------------
+
+const STALE_KEY = "stale-old-key-from-shell-0000";
+
+// 真服务端的样子：旧钥匙一律 401，好钥匙交给假服务端照常处理。
+function rejectingStale(server) {
+  return async (url, init = {}) => {
+    if (init.headers?.Authorization === `Bearer ${STALE_KEY}`) return new Response('{"error":"invalid_token"}', { status: 401 });
+    return server.fetch(url, init);
+  };
+}
+
+function saveTestKey(dir) {
+  mkdirSync(join(dir, "config", "quriov"), { recursive: true });
+  writeFileSync(join(dir, "config", "quriov", "credentials.json"), JSON.stringify({ key: TEST_KEY }));
+}
+
+async function runWith(argv, { dir, fetchImpl, envVars }) {
+  const stdout = sink();
+  const stderr = sink();
+  let code;
+  let error = null;
+  try {
+    code = await main(argv, {
+      env: { XDG_CONFIG_HOME: join(dir, "config"), ...envVars },
+      stdout,
+      stderr,
+      stdin: { isTTY: false },
+      home: fakeHome(dir),
+      platform: "linux",
+      fetchImpl,
+      sleep: async () => {},
+    });
+  } catch (e) {
+    error = e;
+  }
+  return { code, error, stdout: stdout.text, stderr: stderr.text };
+}
+
+test("钥匙优先级：QURIOV_API_KEY > setup 保存的 > 旧名字；旧名字不能盖过刚保存的", () => {
+  const saved = () => JSON.stringify({ key: "saved" });
+  assert.equal(resolveKey({ env: { QURIOV_ACCESS_KEY: "legacy" }, readFile: saved, path: "/x" }).key, "saved");
+  assert.equal(resolveKey({ env: { QURIOV_MCP_ACCESS_KEY: "legacy" }, readFile: saved, path: "/x" }).source, "quriov setup 保存的钥匙");
+  assert.equal(resolveKey({ env: { QURIOV_API_KEY: "primary", QURIOV_ACCESS_KEY: "legacy" }, readFile: saved, path: "/x" }).key, "primary");
+  const all = resolveKeys({ env: { QURIOV_API_KEY: "p", QURIOV_MCP_KEY: "l", QURIOV_ACCESS_KEY: "saved" }, readFile: saved, path: "/x" });
+  assert.deepEqual(
+    all.map((k) => k.source),
+    ["环境变量 QURIOV_API_KEY 的钥匙", "quriov setup 保存的钥匙", "环境变量 QURIOV_MCP_KEY 的钥匙"],
+    "按优先级排，重复的钥匙只留一份",
+  );
+});
+
+test("旧环境变量里是失效钥匙、本机存着好钥匙：直接用好钥匙，account 说清用的是哪一把", async () => {
+  const dir = workspace();
+  saveTestKey(dir);
+  const server = createServer();
+  const { code, error, stdout } = await runWith(["account"], {
+    dir,
+    fetchImpl: rejectingStale(server),
+    envVars: { QURIOV_ACCESS_KEY: STALE_KEY },
+  });
+  assert.equal(error, null, String(error?.message));
+  assert.equal(code, 0);
+  assert.match(stdout, /正在用quriov setup 保存的钥匙/);
+  assert.ok(!stdout.includes(TEST_KEY) && !stdout.includes(STALE_KEY));
+});
+
+test("QURIOV_API_KEY 里的钥匙被拒、本机存着好钥匙：自动换用一次，并提醒删掉那个环境变量", async () => {
+  const dir = workspace();
+  saveTestKey(dir);
+  const server = createServer();
+  const { code, error, stdout, stderr } = await runWith(["account"], {
+    dir,
+    fetchImpl: rejectingStale(server),
+    envVars: { QURIOV_API_KEY: STALE_KEY },
+  });
+  assert.equal(error, null, String(error?.message));
+  assert.equal(code, 0);
+  assert.match(stdout, /正在用quriov setup 保存的钥匙/);
+  assert.match(stderr, /环境变量 QURIOV_API_KEY 里的钥匙没通过验证/);
+  assert.match(stderr, /删掉 QURIOV_API_KEY/);
+  assert.ok(!stderr.includes(TEST_KEY) && !stderr.includes(STALE_KEY));
+});
+
+test("钥匙没通过验证：报错说清是哪个来源的钥匙（不打印钥匙）", async () => {
+  const dir = workspace();
+  const server = createServer();
+  const { error } = await runWith(["account"], {
+    dir,
+    fetchImpl: rejectingStale(server),
+    envVars: { QURIOV_MCP_ACCESS_KEY: STALE_KEY },
+  });
+  assert.equal(error?.code, "unauthorized");
+  assert.match(error.message, /正在用环境变量 QURIOV_MCP_ACCESS_KEY 的钥匙/);
+  assert.match(error.message, /旧的环境变量/);
+  assert.ok(!error.message.includes(STALE_KEY));
+});
+
+test("doctor：第一行说清用的是哪把钥匙；换用过备选钥匙时提醒删环境变量", async () => {
+  const dir = workspace();
+  saveTestKey(dir);
+  const server = createServer();
+  const { code, stdout, stderr } = await runWith(["doctor"], {
+    dir,
+    fetchImpl: rejectingStale(server),
+    envVars: { QURIOV_API_KEY: STALE_KEY },
+  });
+  assert.equal(code, 0, stdout);
+  assert.match(stdout, /\[通过\] 钥匙可用（正在用quriov setup 保存的钥匙）/);
+  assert.match(stderr, /删掉 QURIOV_API_KEY/);
+});
+
+test("doctor：任何失败都给中文原因，不甩出看不懂的异常", async () => {
+  const dir = workspace();
+  const server = createServer();
+  // 钥匙不对：不抛异常，逐项说原因
+  const bad = await runWith(["doctor"], { dir, fetchImpl: rejectingStale(server), envVars: { QURIOV_API_KEY: STALE_KEY } });
+  assert.equal(bad.error, null, String(bad.error?.message));
+  assert.equal(bad.code, 1);
+  assert.match(bad.stdout, /\[没过\] 钥匙可用：钥匙没通过验证（HTTP 401）（正在用环境变量 QURIOV_API_KEY 的钥匙）/);
+  assert.match(bad.stdout, /\[没过\] MCP 连得上、核心工具齐全：钥匙没通过，没法检查/);
+  // 意外异常（不是命令行自己的报错）：翻成一句中文，不冒英文堆栈
+  const weird = await runWith(["doctor"], {
+    dir,
+    envVars: { QURIOV_API_KEY: TEST_KEY },
+    fetchImpl: async (url, init) => {
+      const body = typeof init.body === "string" ? JSON.parse(init.body) : null;
+      if (body?.method === "tools/list") {
+        return { ok: true, status: 200, headers: new Headers(), text: async () => { throw new TypeError("boom"); } };
+      }
+      return server.fetch(url, init);
+    },
+  });
+  assert.equal(weird.error, null, String(weird.error?.message));
+  assert.equal(weird.code, 1);
+  assert.match(weird.stdout, /\[没过\] MCP 连得上、核心工具齐全：命令行内部出错（TypeError）/);
+  assert.doesNotMatch(weird.stdout, /boom|DoctorError/);
 });
