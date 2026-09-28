@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "distributionVersion": "1.1.0",
+  "distributionVersion": "1.1.1",
   "repository": "https://github.com/Quriov/Quriov-MCP",
-  "releaseTag": "v1.1.0",
+  "releaseTag": "v1.1.1",
   "commitPinSource": "website_prompt",
   "manifestHashAlgorithm": "sha256",
   "manifestHashSource": "website_prompt",
@@ -24,6 +24,7 @@
   "cli": {
     "entrypoint": "bin/quriov.mjs",
     "guide": "CLI.md",
+    "installTarball": "https://github.com/Quriov/Quriov-MCP/releases/download/v1.1.1/quriov-mcp-distribution-1.1.1.tgz",
     "minimumNodeVersion": "20",
     "dependencies": [],
     "credentialInputs": [
@@ -67,6 +68,6 @@
     "recipes/claude-code.md": "f317b1a8f30ea6d4f789c79fd7681a2b791a2fdf3952eb7e0d6b8efc56a963be",
     "recipes/cursor.md": "a48685a7ef1c729d3f128489a59773b44795baf676c1459c167be9c785e9db76",
     "bin/quriov-mcp-doctor.mjs": "d1b21cfacaf83f4cb1277d5d70a702a315543e8edbc147745c8470c4d11c6d41",
-    "bin/quriov.mjs": "9c40eac457f3da9a2d04012ddf6f4abc23f99cf08ba6648d9615755d3accc435"
+    "bin/quriov.mjs": "726ad0b3740d21a6bcb681be603684147a1849f703dbb6a10ec3eecf54f6a8d1"
   }
 }

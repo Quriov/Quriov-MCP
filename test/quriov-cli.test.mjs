@@ -434,6 +434,13 @@ test("batch run：自动上传、提交、轮询、下载到 out/货号/图位.p
   const stateText = readFileSync(join(out, ".quriov", stateFiles(join(out, ".quriov"))[0]), "utf8");
   for (const text of [stdout, stderr, cost, stateText]) assert.ok(!text.includes(TEST_KEY));
   assert.match(stdout, /完成 4，失败 0/);
+
+  // 进度行打印图的真实路径（绝对路径），不是看起来像相对当前目录的 ./A001/xxx.png
+  const doneLines = stderr.split("\n").filter((line) => line.includes(" 完成 "));
+  assert.equal(doneLines.length, 4);
+  for (const line of doneLines) assert.ok(!/→ \.[\/]/.test(line), `进度行不该是 ./ 开头的相对路径：${line}`);
+  assert.ok(stderr.includes(`→ ${join(out, "A001", "main_image.png")}`), stderr);
+  assert.ok(stderr.includes(`→ ${join(out, "B002", "scene.png")}`), stderr);
 });
 
 test("控速：服务端每分钟上限内自动排队（每次工具调用算 2 次）", async () => {
@@ -451,7 +458,7 @@ test("控速：服务端每分钟上限内自动排队（每次工具调用算 2
 // 断点续跑
 // ---------------------------------------------------------------------------
 
-test("resume：中断后接着跑，已提交的不重复提交，崩在「提交中」的用原编号重交，不重复扣钱", async () => {
+test("resume：中断后接着跑，已提交的不重复提交，崩在「已发出、待确认」的用原编号重交，不重复扣钱", async () => {
   const dir = workspace();
   const server = createServer({ pollsUntilDone: 1 });
   const out = join(dir, "out");
@@ -472,7 +479,7 @@ test("resume：中断后接着跑，已提交的不重复提交，崩在「提�
   assert.match(first.stdout, /quriov batch resume/);
   assert.equal(server.toolCalls("generate_image").length, 2);
 
-  // 再模拟一种更糟的中断：第 3 个任务已经发出去了，但回应还没落盘（状态停在「提交中」）
+  // 再模拟一种更糟的中断：第 3 个任务已经发出去了，但回应还没落盘（状态停在「已发出、待确认」）
   const stateDir = join(out, ".quriov");
   const stateFile = join(stateDir, stateFiles(stateDir)[0]);
   const state = JSON.parse(readFileSync(stateFile, "utf8"));
@@ -487,6 +494,15 @@ test("resume：中断后接着跑，已提交的不重复提交，崩在「提�
   };
   writeFileSync(stateFile, JSON.stringify(state));
   server.tools.generate_image(third.args); // 服务端其实已经收下了
+
+  // 这时看进度：发出去但没收到回应的任务不能算成「待提交」，要单独标「已发出、待确认」
+  const midStatus = await run(["batch", "status", out], { dir });
+  assert.equal(midStatus.error, null, String(midStatus.error?.message));
+  assert.match(midStatus.stdout, /待提交 1 · 已发出、待确认 1 ·/);
+  assert.match(midStatus.stdout, /resume 会用原任务编号重发确认，不会重复扣钱/);
+  const midJson = JSON.parse((await run(["batch", "status", out, "--json"], { dir })).stdout);
+  assert.equal(midJson.counts.submitting, 1);
+  assert.equal(midJson.counts.pending, 1);
   const generationsBefore = server.generations.size;
 
   const second = await run(["batch", "resume", state.batchId], { dir, server });
@@ -496,7 +512,7 @@ test("resume：中断后接着跑，已提交的不重复提交，崩在「提�
   assert.equal(generationsBefore, 3);
   assert.equal(server.generations.size, 4);
   const replay = server.toolCalls("generate_image").filter((c) => c.args.idempotency_key === third.idempotencyKey);
-  assert.equal(replay.length, 1, "提交中的任务用原编号重交一次");
+  assert.equal(replay.length, 1, "已发出、待确认的任务用原编号重交一次");
   for (const file of ["A001/main_image.png", "A001/scene.png", "B002/main_image.png", "B002/scene.png"]) {
     assert.ok(existsSync(join(out, file)), file);
   }

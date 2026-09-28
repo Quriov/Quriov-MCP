@@ -28,7 +28,7 @@ import { pathToFileURL } from "node:url";
 
 import { PROTOCOL_VERSION, runDoctor } from "./quriov-mcp-doctor.mjs";
 
-export const VERSION = "1.1.0";
+export const VERSION = "1.1.1";
 export const ORIGIN = "https://quriovai.com";
 export const MCP_ENDPOINT = `${ORIGIN}/mcp/v1`;
 export const UPLOAD_ENDPOINT = `${ORIGIN}/api/v1/mcp/uploads`;
@@ -963,9 +963,14 @@ function csvCell(value) {
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
+// 「submitting」= 请求已经发出去，但没收到（或没来得及存下）服务端的回应，比如提交途中被 Ctrl+C。
+// 服务端可能已经收下并记账，所以它不是「待提交」；续跑会用原任务编号重发，服务端认得出，不会重复扣钱。
+const SENT_UNCONFIRMED = "已发出、待确认";
+const SENT_UNCONFIRMED_NOTE = `「${SENT_UNCONFIRMED}」= 请求已发出但没收到回应；resume 会用原任务编号重发确认，不会重复扣钱。`;
+
 const STATUS_LABELS = Object.freeze({
   pending: "待提交",
-  submitting: "提交中",
+  submitting: "已发出、待确认",
   running: "生成中",
   download_retry: "待下载",
   done: "完成",
@@ -1133,7 +1138,8 @@ export async function runBatch(state, client, {
     job.status = "done";
     job.errorCode = null;
     job.errorMessage = item.status === "partial" ? `只出了 ${media.length}/${job.n} 张（其余生成失败，没扣点）` : null;
-    const where = files.length ? files.map((f) => f.replace(state.outDir, ".")).join("、") : "（没有图）";
+    // 打印真实路径：以前写成 ./货号/图位.png（相对输出目录），看起来像相对当前目录，容易找错地方。
+    const where = files.length ? files.join("、") : "（没有图）";
     log(`${label(job)} 完成 ${media.length} 张，${formatCredits(job.credits) || "?"} 点 → ${where}`);
   };
 
@@ -1458,8 +1464,9 @@ function describeFinish(state, result) {
   const c = result.counts;
   const lines = [];
   lines.push(
-    `批次 ${state.batchId}：完成 ${c.done}，失败 ${c.failed}，生成中 ${c.running}，待提交 ${c.pending + c.submitting}，待下载 ${c.download_retry}。`,
+    `批次 ${state.batchId}：完成 ${c.done}，失败 ${c.failed}，生成中 ${c.running}，待提交 ${c.pending}，${SENT_UNCONFIRMED} ${c.submitting}，待下载 ${c.download_retry}。`,
   );
+  if (c.submitting) lines.push(SENT_UNCONFIRMED_NOTE);
   const credits = sumCredits(state.jobs.map((j) => j.credits));
   lines.push(`已扣点数（服务端返回）合计 ${credits}；明细：${result.costFile}`);
   if (result.paused) {
@@ -1740,7 +1747,8 @@ export async function main(argv, io = {}) {
       }
       const c = statusCounts(state);
       print(`批次 ${state.batchId}（${state.createdAt}），输出 ${state.outDir}`);
-      print(`  完成 ${c.done} · 失败 ${c.failed} · 生成中 ${c.running} · 待提交 ${c.pending + c.submitting} · 待下载 ${c.download_retry}，共 ${state.jobs.length}`);
+      print(`  完成 ${c.done} · 失败 ${c.failed} · 生成中 ${c.running} · 待提交 ${c.pending} · ${SENT_UNCONFIRMED} ${c.submitting} · 待下载 ${c.download_retry}，共 ${state.jobs.length}`);
+      if (c.submitting) print(`  ${SENT_UNCONFIRMED_NOTE}`);
       print(`  已扣点数（服务端返回）合计 ${sumCredits(state.jobs.map((j) => j.credits))}；明细 ${join(state.outDir, state.costFile)}`);
       for (const job of state.jobs.filter((j) => j.status === "failed")) print(`  失败 ${job.sku} / ${job.slot}：${job.errorMessage}`);
       if (isUnfinishedState(state) || c.failed) print(`  接着跑：quriov batch resume ${state.batchId}${c.failed ? " [--retry-failed]" : ""}`);

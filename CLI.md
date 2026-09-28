@@ -15,9 +15,17 @@
 需要 Node.js 20 或更新版本。
 
 ```text
-npm install -g github:Quriov/Quriov-MCP#v1.1.0
+npm install -g https://github.com/Quriov/Quriov-MCP/releases/download/v1.1.1/quriov-mcp-distribution-1.1.1.tgz
 quriov --help
 ```
+
+装的是 GitHub 发布页上附带的安装包（`npm pack` 打出来的 `.tgz`），npm 10 / 11 / 12 都能直接装，不用加任何参数。装完 `quriov --version` 应显示 `1.1.1`。
+
+> 旧写法 `npm install -g github:Quriov/Quriov-MCP#v1.1.1`（直接从 git 装）也能用，但 **npm 12 默认不许从 git 装**，会报 `EALLOWGIT`；用 npm 12 又想走这条路，要加 `--allow-git=all`：
+>
+> ```text
+> npm install -g --allow-git=all github:Quriov/Quriov-MCP#v1.1.1
+> ```
 
 不想全局安装，也可以在本仓检出后直接运行 `node bin/quriov.mjs --help`。零依赖，不会装任何第三方包。
 

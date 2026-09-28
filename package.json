@@ -1,6 +1,6 @@
 {
   "name": "quriov-mcp-distribution",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "description": "Pinned recipes, a read-only doctor, and the official quriov CLI for Quriov MCP",
   "type": "module",
