@@ -19,7 +19,8 @@ the MCP server source, a plugin, or a general installer.
 和 MCP 同一把钥匙、同一个后端。聊天里出一两张用 MCP；批量、用本地参考图、要把图存进文件夹，用命令行。完整中文说明见 [`CLI.md`](CLI.md)。
 
 ```text
-npm install -g github:Quriov/Quriov-MCP#v1.1.0   # 需要 Node 20+，Mac / Windows 都行
+# 需要 Node 20+，Mac / Windows 都行；npm 10 / 11 / 12 都能直接装
+npm install -g https://github.com/Quriov/Quriov-MCP/releases/download/v1.1.1/quriov-mcp-distribution-1.1.1.tgz
 quriov login                                      # 粘贴网页上建的「MCP」钥匙（不回显）
 
 # 20 个商品 × 每个 9 个图位：一张表，每行一个商品

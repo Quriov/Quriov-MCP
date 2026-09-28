@@ -44,6 +44,21 @@ jobs:
           node bin/quriov.mjs --help > /dev/null
           npm pack --dry-run
 
+      - name: Install from the packed tarball (the documented install path)
+        shell: bash
+        run: |
+          # The release ships this exact `npm pack` tarball; npm 12 refuses git installs by default
+          # (allow-git=none), so the tarball is what users install. Prove it installs and runs.
+          tarball="$(npm pack --silent)"
+          prefix="$(mktemp -d)"
+          npm install -g --prefix "$prefix" "./$tarball"
+          version="$("$prefix/bin/quriov" --version)"
+          expected="$(node -p 'require("./package.json").version')"
+          test "$version" = "$expected" || { echo "installed quriov reports $version, expected $expected"; exit 1; }
+          test -x "$prefix/bin/quriov-mcp-doctor"
+          rm -f "$tarball"
+          echo "tarball $tarball installs and reports $version"
+
       - name: Fail closed on contract drift or secret-like content
         shell: bash
         run: |
