@@ -37,11 +37,9 @@ import {
   writeAtomic,
 } from "../lib/common.mjs";
 import {
-  DEFAULT_REQUESTS_PER_MINUTE,
   IMAGE_EXTENSIONS,
   MAX_UPLOAD_BYTES,
   QuriovClient,
-  RequestBudget,
   parseToolError,
 } from "../lib/transport.mjs";
 import {
@@ -63,7 +61,6 @@ export {
   MCP_ENDPOINT,
   ORIGIN,
   QuriovClient,
-  RequestBudget,
   UPLOAD_ENDPOINT,
   VERSION,
   describeError,
@@ -798,15 +795,6 @@ export async function runBatch(state, client, {
     try {
       result = await client.generateImage(job.args);
     } catch (error) {
-      if (error.code === "daily_quota_exhausted") {
-        if (firstSend) {
-          // 这一下在服务端记账之前就被挡了：退回「待提交」，明天重新上传、重新编号。
-          job.status = "pending";
-          job.args = null;
-          job.idempotencyKey = null;
-        }
-        throw error;
-      }
       if (error.fatal) throw error;
       failJob(job, error.code, error.message);
       return;
@@ -851,10 +839,7 @@ export async function runBatch(state, client, {
         try {
           await submit(job);
         } catch (error) {
-          if (error.code === "daily_quota_exhausted") {
-            paused = { code: error.code, message: error.message, retryAfterSeconds: error.retryAfterSeconds };
-            state.pausedUntil = error.retryAfterSeconds ? new Date(now() + error.retryAfterSeconds * 1000).toISOString() : null;
-          } else if (error.code === "insufficient_credits") {
+          if (error.code === "insufficient_credits") {
             paused = { code: error.code, message: describeError("insufficient_credits") };
           } else {
             fatal = error;
@@ -935,7 +920,6 @@ const FLAG_SPEC = Object.freeze({
   "--out": "out",
   "--concurrency": "concurrency",
   "--poll-seconds": "pollSeconds",
-  "--rpm": "rpm",
   "--client": "client",
 });
 const BOOLEAN_FLAGS = Object.freeze({
@@ -1038,7 +1022,7 @@ export const HELP = `Quriov 官方命令行 ${VERSION} —— 和 Quriov MCP 同
   每个模板 = 一个图位）· prompt 提示词 · model 模型 · aspect_ratio 比例 · n 每个图位几张（1-4）
   文件夹模式：每个子文件夹是一个商品，里面的图当参考图，可放 prompt.txt；用 --templates 指定图位。
 
-退出码：0 全部完成 · 1 出错 · 2 用法不对 · 3 有任务失败 · 4 暂停（服务端限额 / 网络），可 resume
+退出码：0 全部完成 · 1 出错 · 2 用法不对 · 3 有任务失败 · 4 暂停（余额不足 / 网络 / 服务端临时故障），可 resume
 `;
 
 async function readSecret(prompt, { stdin = process.stdin, stderr = process.stderr, piped = false } = {}) {
@@ -1171,7 +1155,6 @@ export async function main(argv, io = {}) {
       sleep,
       now,
       log,
-      requestsPerMinute: intOption(args.rpm, "--rpm", { min: 4, max: 28, fallback: DEFAULT_REQUESTS_PER_MINUTE }),
     });
   };
   const runOptions = () => ({
