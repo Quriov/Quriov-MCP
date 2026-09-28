@@ -24,6 +24,13 @@ The doctor is read-only. It may initialize the fixed endpoint, list the exact
 eight public tools, and call `get_account`, but it must not print account data,
 write configuration, generate media, spend credit, or revoke credentials.
 
+The CLI (`bin/quriov.mjs`) spends credit only on the user's explicit command
+after a server-side estimate and confirmation. It talks to the fixed MCP
+endpoint plus the reference-image upload endpoint, downloads results from the
+presigned `https` URLs those responses contain without sending the key, and
+keeps its batch state and cost list in the user's own output folder. It never
+accepts a key or endpoint as a command-line argument.
+
 ## Public information boundary
 
 Reports and fixes must not publish provider routing, internal prompts,

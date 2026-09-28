@@ -1,0 +1,771 @@
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import {
+  CliError,
+  HELP,
+  KEY_ENV_NAMES,
+  MCP_ENDPOINT,
+  QuriovClient,
+  RequestBudget,
+  UPLOAD_ENDPOINT,
+  loadSpec,
+  main,
+  parseArgv,
+  parseCsv,
+  requireKey,
+  resolveKey,
+  safeName,
+  sumCredits,
+} from "../bin/quriov.mjs";
+
+const TEST_KEY = "unit-test-cli-key-never-print";
+
+// ---------------------------------------------------------------------------
+// 假服务端：MCP JSON-RPC（8 个工具里命令行用到的那几个）+ 参考图上传 + 结果图下载。
+// 不连任何真实地址，也不花钱。
+// ---------------------------------------------------------------------------
+
+function jsonResponse(payload, status = 200) {
+  return new Response(JSON.stringify(payload), { status, headers: { "content-type": "application/json" } });
+}
+
+function toolError(code, extra = {}) {
+  const body = { code, message: "public message", retryable: false, ...extra };
+  return { isError: true, content: [{ type: "text", text: `Error executing tool x: ${JSON.stringify(body)}` }] };
+}
+
+function createServer({ pollsUntilDone = 1, onTool = null, onHttp = null } = {}) {
+  const server = {
+    generations: new Map(), // idempotency_key -> gen
+    calls: [], // { kind, name, args }
+    downloads: [], // { url, headers }
+    uploads: 0,
+    toolCalls(name) {
+      return this.calls.filter((c) => c.kind === "tool" && c.name === name);
+    },
+  };
+  let seq = 0;
+
+  const genView = (gen) => {
+    const view = {
+      request_id: gen.requestId,
+      request_status: "succeeded",
+      generation_id: gen.generationId,
+      status: gen.status,
+    };
+    if (gen.status === "succeeded") {
+      view.credits = (gen.n * 0.05).toFixed(2);
+      view.billing_status = "settled";
+      view.media = Array.from({ length: gen.n }, (_, i) => ({
+        type: "image",
+        url: `https://oss.example.test/mcp-out/${gen.generationId}/${i}.png?sig=abc`,
+        content_type: "image/png",
+      }));
+    }
+    return view;
+  };
+
+  const tools = {
+    list_capabilities: () => ({
+      revision: "r1",
+      generated_at: "2026-09-28T00:00:00Z",
+      models: [
+        {
+          target: "image",
+          id: "gpt-image-2.5-2K",
+          display_name: "Image 2.5 2K",
+          modality: "image",
+          pricing_unit: "call",
+          supports_cancel: false,
+          available: true,
+          minimum_profile: { units: "1", options: { aspect_ratio: "1:1" }, required_media: [], allowed_media: ["image"] },
+        },
+      ],
+      templates: [
+        { id: "main_image", name: "主图", description: "白底主图", aspect_ratio: "1:1" },
+        { id: "scene", name: "场景图", description: "场景", aspect_ratio: "3:4" },
+        { id: "detail", name: "细节图", description: "特写", aspect_ratio: "1:1" },
+      ],
+    }),
+    estimate_cost: (args) => ({
+      model_id: args.model_id,
+      pricing_unit: args.pricing_unit,
+      units: String(args.units),
+      credits: (Number(args.units) * 0.05).toFixed(2),
+    }),
+    get_account: () => ({
+      balance: "100",
+      wallet_type: "organization",
+      quota: {
+        daily_generation_limit: 100,
+        daily_generation_used: 3,
+        daily_generation_remaining: 97,
+        resets_at: "2026-09-29T00:00:00Z",
+        requests_per_minute_limit: 30,
+      },
+    }),
+    generate_image: (args) => {
+      let gen = server.generations.get(args.idempotency_key);
+      if (!gen) {
+        seq += 1;
+        gen = {
+          requestId: `req-${seq}`,
+          generationId: `gen-${seq}`,
+          status: "queued",
+          polls: 0,
+          n: args.options?.batch_size ?? 1,
+          args,
+        };
+        server.generations.set(args.idempotency_key, gen);
+      }
+      return genView(gen);
+    },
+    list_generations: () => {
+      const items = [];
+      for (const gen of server.generations.values()) {
+        gen.polls += 1;
+        if (gen.polls >= pollsUntilDone && gen.status !== "failed") gen.status = "succeeded";
+        items.push(genView(gen));
+      }
+      return { items: items.reverse() };
+    },
+  };
+
+  server.fetch = async (url, init = {}) => {
+    const headers = init.headers ?? {};
+    if (typeof url === "string" && url.startsWith("https://oss.example.test/")) {
+      server.downloads.push({ url, headers });
+      return new Response(new Uint8Array([137, 80, 78, 71, 1, 2, 3, 4]), { status: 200 });
+    }
+    assert.equal(headers.Authorization, `Bearer ${TEST_KEY}`, "API 请求必须带钥匙");
+    assert.match(headers["User-Agent"], /^quriov-cli\//);
+    if (onHttp) {
+      const override = await onHttp(url, init, server);
+      if (override) return override;
+    }
+    if (url === UPLOAD_ENDPOINT) {
+      server.uploads += 1;
+      server.calls.push({ kind: "upload" });
+      assert.ok(init.body instanceof FormData, "上传要用 multipart");
+      assert.ok(init.body.get("file"), "上传字段名必须是 file");
+      return jsonResponse({
+        url: `https://oss.example.test/mcp-refs/${server.uploads}.png?sig=up`,
+        expires_in: 86400,
+        size_bytes: 8,
+        content_type: "image/png",
+      });
+    }
+    assert.equal(url, MCP_ENDPOINT);
+    const request = JSON.parse(init.body);
+    if (request.method === "initialize") {
+      server.calls.push({ kind: "initialize" });
+      return jsonResponse({ jsonrpc: "2.0", id: request.id, result: { protocolVersion: "2025-06-18", capabilities: {} } });
+    }
+    assert.equal(request.method, "tools/call");
+    const { name, arguments: args } = request.params;
+    server.calls.push({ kind: "tool", name, args });
+    let result;
+    const custom = onTool ? await onTool(name, args, server) : undefined;
+    if (custom !== undefined) result = custom;
+    else result = { structuredContent: tools[name](args), isError: false };
+    return jsonResponse({ jsonrpc: "2.0", id: request.id, result });
+  };
+  server.tools = tools;
+  return server;
+}
+
+function fakeClock() {
+  const clock = { t: Date.UTC(2026, 8, 28, 2, 0, 0), slept: [] };
+  clock.now = () => clock.t;
+  clock.sleep = async (ms) => {
+    clock.slept.push(ms);
+    clock.t += ms;
+  };
+  return clock;
+}
+
+function sink() {
+  const s = { text: "" };
+  s.write = (chunk) => {
+    s.text += chunk;
+    return true;
+  };
+  return s;
+}
+
+function workspace() {
+  const dir = mkdtempSync(join(tmpdir(), "quriov-cli-test-"));
+  mkdirSync(join(dir, "refs"));
+  writeFileSync(join(dir, "refs", "a.png"), Buffer.from([137, 80, 78, 71, 0, 0]));
+  writeFileSync(join(dir, "refs", "b.jpg"), Buffer.from([255, 216, 255, 0]));
+  return dir;
+}
+
+function env(dir, extra = {}) {
+  return { QURIOV_MCP_ACCESS_KEY: TEST_KEY, XDG_CONFIG_HOME: join(dir, "config"), APPDATA: join(dir, "config"), ...extra };
+}
+
+async function run(argv, { dir, server, clock = fakeClock(), extraEnv = {}, shouldStop } = {}) {
+  const stdout = sink();
+  const stderr = sink();
+  let code;
+  let error = null;
+  try {
+    code = await main(argv, {
+      env: env(dir, extraEnv),
+      stdout,
+      stderr,
+      stdin: { isTTY: false },
+      fetchImpl: server ? server.fetch : async () => assert.fail("不应该联网"),
+      sleep: clock.sleep,
+      now: clock.now,
+      shouldStop,
+    });
+  } catch (e) {
+    error = e;
+  }
+  return { code, error, stdout: stdout.text, stderr: stderr.text, clock };
+}
+
+function writeCsv(dir, text, name = "products.csv") {
+  const file = join(dir, name);
+  writeFileSync(file, text);
+  return file;
+}
+
+const TWO_BY_TWO = [
+  "sku,refs,templates,prompt",
+  'A001,refs/a.png,main_image;scene,"红色保温杯, 316 不锈钢"',
+  "B002,refs/a.png;refs/b.jpg,main_image;scene,蓝色水杯",
+].join("\n");
+
+function stateFiles(dir) {
+  return readdirSync(dir).filter((n) => n.endsWith(".json"));
+}
+
+// ---------------------------------------------------------------------------
+// 参数与钥匙
+// ---------------------------------------------------------------------------
+
+test("钥匙不能写在命令参数里", () => {
+  for (const bad of ["--key", "--key=abc", "--token", "--api-key=x", "--endpoint", "--base-url=http://evil"]) {
+    assert.throws(() => parseArgv(["gen", bad, "x"]), (e) => e instanceof CliError && e.code === "forbidden_argument", bad);
+  }
+  const parsed = parseArgv(["gen", "-m", "m1", "--ref", "a.png", "--ref=b.png", "-n", "2", "--yes"]);
+  assert.deepEqual(parsed.ref, ["a.png", "b.png"]);
+  assert.equal(parsed.model, "m1");
+  assert.equal(parsed.n, "2");
+  assert.equal(parsed.yes, true);
+  assert.throws(() => parseArgv(["--bogus"]), (e) => e.code === "usage");
+});
+
+test("钥匙：正式名字优先，两个旧名字照认，最后才看 login 保存的文件", () => {
+  assert.deepEqual(KEY_ENV_NAMES, ["QURIOV_MCP_ACCESS_KEY", "QURIOV_MCP_KEY", "QURIOV_ACCESS_KEY"]);
+  const noFile = () => {
+    throw new Error("no file");
+  };
+  assert.equal(resolveKey({ env: { QURIOV_MCP_ACCESS_KEY: "a", QURIOV_MCP_KEY: "b" }, readFile: noFile }).key, "a");
+  assert.equal(resolveKey({ env: { QURIOV_MCP_KEY: " b " }, readFile: noFile }).key, "b");
+  assert.equal(resolveKey({ env: { QURIOV_ACCESS_KEY: "c" }, readFile: noFile }).key, "c");
+  const fromFile = resolveKey({ env: {}, readFile: () => JSON.stringify({ key: "d" }), path: "/x" });
+  assert.equal(fromFile.key, "d");
+  assert.equal(resolveKey({ env: {}, readFile: noFile, path: "/x" }), null);
+  assert.throws(
+    () => requireKey({ env: {}, readFile: noFile, path: "/x" }),
+    (e) => e.code === "missing_key" && e.message.includes("quriov login") && e.message.includes("QURIOV_MCP_ACCESS_KEY"),
+  );
+});
+
+test("--help 列出全部命令", async () => {
+  const dir = workspace();
+  const { code, stdout } = await run(["--help"], { dir });
+  assert.equal(code, 0);
+  for (const word of ["quriov login", "quriov models", "quriov gen", "batch plan", "batch run", "batch status", "batch resume"]) {
+    assert.ok(stdout.includes(word), word);
+  }
+  assert.equal(stdout.trim(), HELP.trim());
+});
+
+// ---------------------------------------------------------------------------
+// 任务表
+// ---------------------------------------------------------------------------
+
+test("CSV：引号、BOM、CRLF、中文表头", () => {
+  const rows = parseCsv('﻿货号,提示词\r\nA,"有逗号, 和 ""引号"""\r\n\r\n');
+  assert.deepEqual(rows, [["货号", "提示词"], ["A", '有逗号, 和 "引号"']]);
+});
+
+test("任务表：2 个商品 × 2 个图位 = 4 次提交，参考图按表格所在文件夹找", () => {
+  const dir = workspace();
+  const spec = loadSpec(writeCsv(dir, TWO_BY_TWO), { model: "gpt-image-2.5-2K" });
+  assert.deepEqual(spec.errors, []);
+  assert.equal(spec.jobs.length, 4);
+  assert.deepEqual(
+    spec.jobs.map((j) => j.key),
+    ["A001/main_image", "A001/scene", "B002/main_image", "B002/scene"],
+  );
+  assert.equal(spec.jobs[2].refs.length, 2);
+  assert.ok(spec.jobs[2].refs[1].endsWith(join("refs", "b.jpg")));
+  assert.equal(spec.jobs[0].prompt, "红色保温杯, 316 不锈钢");
+});
+
+test("任务表：问题一次全报出来，一张都不提交", () => {
+  const dir = workspace();
+  const long = "长".repeat(8001);
+  const csv = [
+    "sku,refs,templates,prompt,n",
+    "A,refs/missing.png,main_image,x,1",
+    "B,,main_image;main_image,x,1",
+    "C,,,,1",
+    `D,,,${long},1`,
+    "E,refs/a.png,,x,9",
+  ].join("\n");
+  const spec = loadSpec(writeCsv(dir, csv), { model: "m" });
+  const all = spec.errors.join("\n");
+  assert.match(all, /找不到参考图/);
+  assert.match(all, /图位 main_image 重复/);
+  assert.match(all, /没有提示词/);
+  assert.match(all, /超过 8000 字/);
+  assert.match(all, /1 到 4/);
+});
+
+test("任务表：文件夹模式，每个子文件夹一个商品", () => {
+  const dir = workspace();
+  const root = join(dir, "products");
+  mkdirSync(join(root, "SKU-1"), { recursive: true });
+  writeFileSync(join(root, "SKU-1", "front.png"), "x");
+  writeFileSync(join(root, "SKU-1", "prompt.txt"), "白色 T 恤");
+  const spec = loadSpec(root, { model: "m", templates: ["main_image", "detail"] });
+  assert.deepEqual(spec.errors, []);
+  assert.equal(spec.jobs.length, 2);
+  assert.equal(spec.jobs[0].sku, "SKU-1");
+  assert.equal(spec.jobs[0].prompt, "白色 T 恤");
+  assert.equal(spec.jobs[0].refs.length, 1);
+});
+
+test("Windows 不能用的文件名字符会被换掉", () => {
+  assert.equal(safeName('a/b:c*?"<>|'), "a_b_c______");
+  assert.equal(safeName("CON"), "_CON");
+  assert.equal(safeName("name. "), "name");
+});
+
+test("点数按十进制相加，不出现浮点误差", () => {
+  assert.equal(sumCredits(["0.1", "0.2", null, ""]), "0.3");
+  assert.equal(sumCredits(["1.05", "2.95"]), "4");
+});
+
+// ---------------------------------------------------------------------------
+// 试运行：不联网
+// ---------------------------------------------------------------------------
+
+test("batch plan / batch run --dry-run / gen --dry-run 都不联网、不花钱", async () => {
+  const dir = workspace();
+  const csv = writeCsv(dir, TWO_BY_TWO);
+  for (const argv of [
+    ["batch", "plan", csv, "-m", "gpt-image-2.5-2K"],
+    ["batch", "run", csv, "-m", "gpt-image-2.5-2K", "--dry-run", "-o", join(dir, "out")],
+    ["gen", "-m", "gpt-image-2.5-2K", "-p", "杯子", "--ref", join(dir, "refs", "a.png"), "--dry-run"],
+  ]) {
+    const { code, error, stdout } = await run(argv, { dir }); // 没给 server：任何联网都会 assert.fail
+    assert.equal(error, null, String(error?.message));
+    assert.equal(code, 0);
+    assert.match(stdout, /没有联网/);
+  }
+  const { stdout } = await run(["batch", "plan", csv, "-m", "gpt-image-2.5-2K"], { dir });
+  assert.match(stdout, /2 个商品，4 次提交，共 4 张/);
+  assert.ok(!existsSync(join(dir, "out")), "试运行不应该建输出目录");
+});
+
+test("batch plan --estimate 用服务端估价（免费工具），不提交", async () => {
+  const dir = workspace();
+  const server = createServer();
+  const { code, stdout } = await run(["batch", "plan", writeCsv(dir, TWO_BY_TWO), "-m", "gpt-image-2.5-2K", "--estimate"], {
+    dir,
+    server,
+  });
+  assert.equal(code, 0);
+  assert.match(stdout, /gpt-image-2.5-2K × 4 张 = 0.20 点/);
+  assert.match(stdout, /今天还能提交 97 次/);
+  assert.equal(server.toolCalls("generate_image").length, 0);
+  assert.equal(server.uploads, 0);
+});
+
+// ---------------------------------------------------------------------------
+// 真跑（假服务端）：上传、提交、轮询、下载、花费清单
+// ---------------------------------------------------------------------------
+
+test("batch run：自动上传、提交、轮询、下载到 out/货号/图位.png，并写出花费清单", async () => {
+  const dir = workspace();
+  const server = createServer({ pollsUntilDone: 2 });
+  const out = join(dir, "out");
+  const { code, error, stdout, stderr } = await run(
+    ["batch", "run", writeCsv(dir, TWO_BY_TWO), "-m", "gpt-image-2.5-2K", "-o", out, "--yes"],
+    { dir, server },
+  );
+  assert.equal(error, null, String(error?.message));
+  assert.equal(code, 0);
+
+  // 参考图：两张不同的图各传一次（A001 与 B002 共用 a.png，只传一次）
+  assert.equal(server.uploads, 2);
+  const submits = server.toolCalls("generate_image").map((c) => c.args);
+  assert.equal(submits.length, 4);
+  const scene = submits.find((a) => a.options?.template_id === "scene");
+  assert.equal(scene.options.aspect_ratio, "3:4", "没写比例时用模板自己的比例");
+  assert.ok(scene.input_media.every((m) => m.type === "image_url" && m.value.startsWith("https://")));
+  assert.equal(new Set(submits.map((a) => a.idempotency_key)).size, 4, "每个任务一个唯一编号");
+
+  for (const file of ["A001/main_image.png", "A001/scene.png", "B002/main_image.png", "B002/scene.png"]) {
+    assert.ok(existsSync(join(out, file)), file);
+  }
+  // 下载结果图绝不带钥匙
+  assert.equal(server.downloads.length, 4);
+  for (const d of server.downloads) assert.equal(d.headers.Authorization, undefined);
+
+  const cost = readFileSync(join(out, "cost.csv"), "utf8");
+  assert.ok(cost.startsWith("﻿"));
+  assert.match(cost, /A001,scene,scene,gpt-image-2.5-2K,1,1,0.05,settled,完成/);
+  assert.match(cost, /合计,,,,4,4,0.2,/);
+
+  // 钥匙不出现在任何输出或落盘文件里
+  const stateText = readFileSync(join(out, ".quriov", stateFiles(join(out, ".quriov"))[0]), "utf8");
+  for (const text of [stdout, stderr, cost, stateText]) assert.ok(!text.includes(TEST_KEY));
+  assert.match(stdout, /完成 4，失败 0/);
+});
+
+test("控速：服务端每分钟上限内自动排队（每次工具调用算 2 次）", async () => {
+  const clock = fakeClock();
+  const budget = new RequestBudget({ perMinute: 4, now: clock.now, sleep: clock.sleep });
+  await budget.take(2);
+  await budget.take(2);
+  assert.equal(clock.slept.length, 0);
+  await budget.take(2);
+  assert.equal(clock.slept.length, 1);
+  assert.ok(clock.slept[0] >= 59_000);
+});
+
+// ---------------------------------------------------------------------------
+// 断点续跑
+// ---------------------------------------------------------------------------
+
+test("resume：中断后接着跑，已提交的不重复提交，崩在「提交中」的用原编号重交，不重复扣钱", async () => {
+  const dir = workspace();
+  const server = createServer({ pollsUntilDone: 1 });
+  const out = join(dir, "out");
+  const csv = writeCsv(dir, TWO_BY_TWO);
+
+  // 第一次：提交 2 个以后就中断（模拟 Ctrl+C）
+  let stop = false;
+  const first = await run(["batch", "run", csv, "-m", "gpt-image-2.5-2K", "-o", out, "--yes", "--concurrency", "2"], {
+    dir,
+    server,
+    shouldStop: () => {
+      if (server.toolCalls("generate_image").length >= 2) stop = true;
+      return stop;
+    },
+  });
+  assert.equal(first.error, null, String(first.error?.message));
+  assert.equal(first.code, 4, "没跑完要返回 4（可续跑）");
+  assert.match(first.stdout, /quriov batch resume/);
+  assert.equal(server.toolCalls("generate_image").length, 2);
+
+  // 再模拟一种更糟的中断：第 3 个任务已经发出去了，但回应还没落盘（状态停在「提交中」）
+  const stateDir = join(out, ".quriov");
+  const stateFile = join(stateDir, stateFiles(stateDir)[0]);
+  const state = JSON.parse(readFileSync(stateFile, "utf8"));
+  const third = state.jobs[2];
+  third.status = "submitting";
+  third.idempotencyKey = `qcli-${state.batchId}-2-a1`;
+  third.args = {
+    model: third.model,
+    prompt: third.prompt,
+    idempotency_key: third.idempotencyKey,
+    options: { aspect_ratio: "1:1", template_id: "main_image" },
+  };
+  writeFileSync(stateFile, JSON.stringify(state));
+  server.tools.generate_image(third.args); // 服务端其实已经收下了
+  const generationsBefore = server.generations.size;
+
+  const second = await run(["batch", "resume", state.batchId], { dir, server });
+  assert.equal(second.error, null, String(second.error?.message));
+  assert.equal(second.code, 0);
+  // 服务端总共只有 4 个生成任务：续跑没有给已提交的再开新任务
+  assert.equal(generationsBefore, 3);
+  assert.equal(server.generations.size, 4);
+  const replay = server.toolCalls("generate_image").filter((c) => c.args.idempotency_key === third.idempotencyKey);
+  assert.equal(replay.length, 1, "提交中的任务用原编号重交一次");
+  for (const file of ["A001/main_image.png", "A001/scene.png", "B002/main_image.png", "B002/scene.png"]) {
+    assert.ok(existsSync(join(out, file)), file);
+  }
+  const status = await run(["batch", "status", out], { dir });
+  assert.match(status.stdout, /完成 4 · 失败 0/);
+});
+
+test("batch run：输出目录里已有批次时拒绝，提示用 resume", async () => {
+  const dir = workspace();
+  const server = createServer();
+  const out = join(dir, "out");
+  const csv = writeCsv(dir, TWO_BY_TWO);
+  await run(["batch", "run", csv, "-m", "gpt-image-2.5-2K", "-o", out, "--yes"], { dir, server });
+  const again = await run(["batch", "run", csv, "-m", "gpt-image-2.5-2K", "-o", out, "--yes"], { dir, server });
+  assert.equal(again.error?.code, "out_dir_in_use");
+  assert.match(again.error.message, /quriov batch resume/);
+});
+
+test("resume --retry-failed：失败的换新编号重交，成功的不动", async () => {
+  const dir = workspace();
+  let rejectScene = true;
+  const server = createServer({
+    onTool: (name, args) => {
+      if (name === "generate_image" && rejectScene && args.options?.template_id === "scene") {
+        return {
+          structuredContent: { request_id: `r-${args.idempotency_key}`, request_status: "failed", status: "failed", error_code: "content_rejected", message: "x" },
+          isError: false,
+        };
+      }
+      return undefined;
+    },
+  });
+  const out = join(dir, "out");
+  const first = await run(["batch", "run", writeCsv(dir, TWO_BY_TWO), "-m", "gpt-image-2.5-2K", "-o", out, "--yes"], { dir, server });
+  assert.equal(first.code, 3, "有失败返回 3");
+  assert.match(first.stdout, /内容审核没通过/);
+  const cost = readFileSync(join(out, "cost.csv"), "utf8");
+  assert.match(cost, /A001,scene,scene,gpt-image-2.5-2K,1,0,,,失败/);
+
+  rejectScene = false;
+  const before = server.toolCalls("generate_image").length;
+  const second = await run(["batch", "resume", out, "--retry-failed", "--yes"], { dir, server });
+  assert.equal(second.code, 0, second.stdout + second.stderr);
+  const retried = server.toolCalls("generate_image").slice(before);
+  assert.equal(retried.length, 2, "只重交失败的两个");
+  assert.ok(retried.every((c) => c.args.idempotency_key.endsWith("-a2")));
+});
+
+// ---------------------------------------------------------------------------
+// 报错要说清真实原因
+// ---------------------------------------------------------------------------
+
+test("第一次就 401：说清是钥匙问题的三种可能，包括用途选错", async () => {
+  const dir = workspace();
+  const server = createServer({ onHttp: () => new Response('{"error":"invalid_token"}', { status: 401 }) });
+  const { error } = await run(["account"], { dir, server });
+  assert.equal(error.code, "unauthorized");
+  assert.match(error.message, /撤销/);
+  assert.match(error.message, /API 调用/);
+  assert.ok(!error.message.includes(TEST_KEY));
+});
+
+test("用着用着 401：按每分钟限流处理，等一分钟自动重试", async () => {
+  const dir = workspace();
+  let failOnce = true;
+  const server = createServer({
+    onHttp: (url, init) => {
+      const body = typeof init.body === "string" ? JSON.parse(init.body) : null;
+      if (body?.params?.name === "get_account" && failOnce) {
+        failOnce = false;
+        return new Response('{"error":"invalid_token"}', { status: 401 });
+      }
+      return undefined;
+    },
+  });
+  const { code, error, stderr, clock } = await run(["account"], { dir, server });
+  assert.equal(error, null, String(error?.message));
+  assert.equal(code, 0);
+  assert.match(stderr, /每分钟请求数到上限/);
+  assert.ok(clock.slept.includes(65_000));
+});
+
+test("限流（工具返回 rate_limited、等 60 秒）自动等待重试", async () => {
+  const dir = workspace();
+  let limited = true;
+  const server = createServer({
+    onTool: (name) => {
+      if (name === "get_account" && limited) {
+        limited = false;
+        return toolError("rate_limited", { retryable: true, retry_after_seconds: 60 });
+      }
+      return undefined;
+    },
+  });
+  const { code, stderr, clock } = await run(["account"], { dir, server });
+  assert.equal(code, 0);
+  assert.match(stderr, /60 秒后自动重试/);
+  assert.ok(clock.slept.includes(60_000));
+});
+
+test("今天的提交次数用完：暂停、已提交的照常收尾、没提交的留着明天续跑，返回 4", async () => {
+  const dir = workspace();
+  let submits = 0;
+  const server = createServer({
+    onTool: (name) => {
+      if (name === "generate_image") {
+        submits += 1;
+        if (submits > 1) return toolError("rate_limited", { retryable: true, retry_after_seconds: 50_000 });
+      }
+      return undefined;
+    },
+  });
+  const out = join(dir, "out");
+  const { code, error, stdout } = await run(["batch", "run", writeCsv(dir, TWO_BY_TWO), "-m", "gpt-image-2.5-2K", "-o", out, "--yes"], {
+    dir,
+    server,
+  });
+  assert.equal(error, null, String(error?.message));
+  assert.equal(code, 4);
+  assert.match(stdout, /今天的提交次数用完了/);
+  assert.match(stdout, /按提交次数算，不按张数/);
+  assert.match(stdout, /quriov batch resume/);
+  assert.ok(existsSync(join(out, "A001", "main_image.png")), "已提交的那张照常下载");
+  const state = JSON.parse(readFileSync(join(out, ".quriov", stateFiles(join(out, ".quriov"))[0]), "utf8"));
+  assert.deepEqual(
+    state.jobs.map((j) => j.status),
+    ["done", "pending", "pending", "pending"],
+  );
+  assert.equal(state.jobs[1].idempotencyKey, null, "被挡在记账之前的，编号作废，明天重来");
+  assert.ok(state.pausedUntil);
+});
+
+test("被网站防火墙拦（Cloudflare 1010）：明说不是钥匙问题", async () => {
+  const dir = workspace();
+  const server = createServer({ onHttp: () => new Response("error code: 1010", { status: 403 }) });
+  const { error } = await run(["account"], { dir, server });
+  assert.equal(error.code, "blocked_by_firewall");
+  assert.match(error.message, /不是钥匙问题/);
+});
+
+test("模板编号写错：联网校验时就拦下，一张都不提交", async () => {
+  const dir = workspace();
+  const server = createServer();
+  const csv = writeCsv(dir, "sku,templates,prompt\nA,amazon_main,杯子\n");
+  const { error } = await run(["batch", "run", csv, "-m", "gpt-image-2.5-2K", "-o", join(dir, "out"), "--yes"], { dir, server });
+  assert.equal(error.code, "invalid_spec");
+  assert.match(error.message, /模板 amazon_main 不存在/);
+  assert.equal(server.toolCalls("generate_image").length, 0);
+});
+
+test("模型下架 / 写错：联网校验时就拦下并列出能用的", async () => {
+  const dir = workspace();
+  const server = createServer();
+  const { error } = await run(["gen", "-m", "gpt-image-2", "-p", "杯子", "--yes", "-o", join(dir, "o")], { dir, server });
+  assert.equal(error.code, "invalid_spec");
+  assert.match(error.message, /gpt-image-2 现在不能出图.*gpt-image-2.5-2K/);
+});
+
+test("服务端拒绝某一个任务：只这一个失败，原因翻成中文，其余照跑", async () => {
+  const dir = workspace();
+  const server = createServer({
+    onTool: (name, args) =>
+      name === "generate_image" && args.options?.template_id === "scene" && args.prompt === "蓝色水杯"
+        ? toolError("too_many_media")
+        : undefined,
+  });
+  const out = join(dir, "out");
+  const { code, stdout } = await run(["batch", "run", writeCsv(dir, TWO_BY_TWO), "-m", "gpt-image-2.5-2K", "-o", out, "--yes"], {
+    dir,
+    server,
+  });
+  assert.equal(code, 3);
+  assert.match(stdout, /完成 3，失败 1/);
+  assert.match(stdout, /参考图张数超过这个模型的上限/);
+});
+
+test("参考图上传被拒（不是真图片）：说清按内容判断", async () => {
+  const dir = workspace();
+  const client = new QuriovClient({
+    key: TEST_KEY,
+    fetchImpl: async () => new Response("{}", { status: 415 }),
+    sleep: async () => {},
+  });
+  await assert.rejects(client.upload(join(dir, "refs", "a.png")), (e) => e.code === "unsupported_media_format" && /改扩展名没用/.test(e.message));
+});
+
+test("login：钥匙先验证再保存；没通过就不落盘", async () => {
+  const dir = workspace();
+  const piped = (text) => ({
+    isTTY: false,
+    async *[Symbol.asyncIterator]() {
+      yield text;
+    },
+  });
+  const server = createServer();
+  const stdout = sink();
+  const code = await main(["login"], {
+    env: { XDG_CONFIG_HOME: join(dir, "config") },
+    stdout,
+    stderr: sink(),
+    stdin: piped(`${TEST_KEY}\n`),
+    fetchImpl: server.fetch,
+    sleep: async () => {},
+  });
+  assert.equal(code, 0);
+  const saved = JSON.parse(readFileSync(join(dir, "config", "quriov", "credentials.json"), "utf8"));
+  assert.equal(saved.key, TEST_KEY);
+  assert.ok(!stdout.text.includes(TEST_KEY));
+
+  const dir2 = workspace();
+  const bad = createServer({ onHttp: () => new Response("{}", { status: 401 }) });
+  await assert.rejects(
+    main(["login"], {
+      env: { XDG_CONFIG_HOME: join(dir2, "config") },
+      stdout: sink(),
+      stderr: sink(),
+      stdin: piped(`${TEST_KEY}\n`),
+      fetchImpl: bad.fetch,
+      sleep: async () => {},
+    }),
+    (e) => e.code === "unauthorized",
+  );
+  assert.ok(!existsSync(join(dir2, "config", "quriov", "credentials.json")));
+});
+
+test("非交互环境要花钱却没加 --yes：拒绝并说明", async () => {
+  const dir = workspace();
+  const server = createServer();
+  const { error } = await run(["gen", "-m", "gpt-image-2.5-2K", "-p", "杯子", "-o", join(dir, "o")], { dir, server });
+  assert.equal(error.code, "needs_confirmation");
+  assert.equal(server.toolCalls("generate_image").length, 0);
+});
+
+test("下载失败（链接过期等）：下一轮重新取链接再下，不重复提交", async () => {
+  const dir = workspace();
+  const server = createServer();
+  let failFirstDownload = true;
+  const baseFetch = server.fetch;
+  server.fetch = async (url, init) => {
+    if (typeof url === "string" && url.startsWith("https://oss.example.test/mcp-out/") && failFirstDownload) {
+      failFirstDownload = false;
+      return new Response("expired", { status: 403 });
+    }
+    return baseFetch(url, init);
+  };
+  const out = join(dir, "out");
+  const csv = writeCsv(dir, "sku,templates,prompt\nA,main_image,杯子\n");
+  const { code, stderr } = await run(["batch", "run", csv, "-m", "gpt-image-2.5-2K", "-o", out, "--yes"], { dir, server });
+  assert.equal(code, 0);
+  assert.match(stderr, /下载失败（第 1 次）/);
+  assert.ok(existsSync(join(out, "A", "main_image.png")));
+  assert.equal(server.toolCalls("generate_image").length, 1);
+});
+
+test("gen：一次出 2 张带参考图，文件和花费清单落到输出目录", async () => {
+  const dir = workspace();
+  const server = createServer();
+  const out = join(dir, "gen-out");
+  const { code, error } = await run(
+    ["gen", "-m", "gpt-image-2.5-2K", "-p", "白底主图", "--ref", join(dir, "refs", "a.png"), "-n", "2", "-o", out, "--yes"],
+    { dir, server },
+  );
+  assert.equal(error, null, String(error?.message));
+  assert.equal(code, 0);
+  const [call] = server.toolCalls("generate_image");
+  assert.equal(call.args.options.batch_size, 2);
+  assert.equal(call.args.input_media.length, 1);
+  const files = readdirSync(out);
+  assert.equal(files.filter((f) => f.endsWith(".png")).length, 2);
+  const costFile = files.find((f) => f.startsWith("cost-") && f.endsWith(".csv"));
+  assert.match(readFileSync(join(out, costFile), "utf8"), /gen,image,,gpt-image-2.5-2K,2,2,0.10,settled,完成/);
+});

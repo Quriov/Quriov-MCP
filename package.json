@@ -1,10 +1,11 @@
 {
   "name": "quriov-mcp-distribution",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "private": true,
-  "description": "Pinned recipes and a read-only doctor for Quriov MCP",
+  "description": "Pinned recipes, a read-only doctor, and the official quriov CLI for Quriov MCP",
   "type": "module",
   "bin": {
+    "quriov": "./bin/quriov.mjs",
     "quriov-mcp-doctor": "./bin/quriov-mcp-doctor.mjs"
   },
   "scripts": {

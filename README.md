@@ -10,9 +10,25 @@ and check or cancel the resulting task. The hosted service is operated at:
 https://quriovai.com/mcp/v1
 ```
 
-This repository is the public distribution layer for client setup and
-read-only validation. It is not the MCP server source, a plugin, or a general
-installer.
+This repository is the public distribution layer for client setup,
+read-only validation, and the official `quriov` command-line tool. It is not
+the MCP server source, a plugin, or a general installer.
+
+## 命令行 quriov（批量出图）
+
+和 MCP 同一把钥匙、同一个后端。聊天里出一两张用 MCP；批量、用本地参考图、要把图存进文件夹，用命令行。完整中文说明见 [`CLI.md`](CLI.md)。
+
+```text
+npm install -g github:Quriov/Quriov-MCP#v1.1.0   # 需要 Node 20+，Mac / Windows 都行
+quriov login                                      # 粘贴网页上建的「MCP」钥匙（不回显）
+
+# 20 个商品 × 每个 9 个图位：一张表，每行一个商品
+quriov batch plan products.csv -m gpt-image-2.5-2K --estimate   # 只估价，不花钱
+quriov batch run  products.csv -m gpt-image-2.5-2K -o ./out     # 确认后提交、等结果、下载
+quriov batch resume ./out                                       # 断了接着跑，不重复扣钱
+```
+
+结果在 `out/<货号>/<图位>.png`，每个任务花了多少点在 `out/cost.csv`（数字来自服务端返回）。
 
 ## Before you install
 
@@ -56,6 +72,10 @@ Primary sources:
   configuration and credential reference.
 - The doctor is read-only. It initializes the server, checks the exact tool
   contract, and calls `get_account` without printing account data.
+- The CLI uses the same key and the same eight tools, plus
+  `https://quriovai.com/api/v1/mcp/uploads` for local reference images. It
+  downloads results from the presigned URLs the tools return, without sending
+  the key.
 
 ## Repository map
 
@@ -73,6 +93,9 @@ Primary sources:
   of the fixed endpoint and exact eight-tool contract.
 - [`bin/quriov-mcp-doctor.mjs`](bin/quriov-mcp-doctor.mjs): read-only protocol
   doctor, covered by Node tests.
+- [`bin/quriov.mjs`](bin/quriov.mjs): official zero-dependency CLI, covered by
+  Node tests with a mocked HTTP layer. Chinese guide: [`CLI.md`](CLI.md);
+  example batch spec: [`examples/products.csv`](examples/products.csv).
 - [`SECURITY.md`](SECURITY.md): private reporting path and threat model.
 
 After checking out the commit or tag supplied by the Quriov website and

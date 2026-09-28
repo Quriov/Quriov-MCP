@@ -40,6 +40,8 @@ jobs:
       - name: Validate executable syntax and package contents
         run: |
           node --check bin/quriov-mcp-doctor.mjs
+          node --check bin/quriov.mjs
+          node bin/quriov.mjs --help > /dev/null
           npm pack --dry-run
 
       - name: Fail closed on contract drift or secret-like content
@@ -51,6 +53,7 @@ jobs:
           import { readFile } from "node:fs/promises";
 
           const endpoint = "https://quriovai.com/mcp/v1";
+          const uploadEndpoint = "https://quriovai.com/api/v1/mcp/uploads";
           const tools = [
             "cancel_generation",
             "check_generation",
@@ -68,10 +71,18 @@ jobs:
             throw new Error("installation endpoint or scope drifted");
           }
           if (
-            manifest.allowedNetworkTargets.length !== 1 ||
-            manifest.allowedNetworkTargets[0] !== endpoint
+            JSON.stringify(manifest.allowedNetworkTargets) !==
+            JSON.stringify([endpoint, uploadEndpoint])
           ) {
             throw new Error("installation network allowlist drifted");
+          }
+          const cliSource = await readFile("bin/quriov.mjs", "utf8");
+          const cliTargets = [...cliSource.matchAll(/https:\/\/quriovai\.com[^\s"'`)]*/g)].map((m) => m[0]);
+          for (const target of cliTargets) {
+            // The CLI builds every Quriov URL from one ORIGIN constant; any other literal is drift.
+            if (target !== "https://quriovai.com") {
+              throw new Error(`CLI references an unlisted Quriov URL: ${target}`);
+            }
           }
           if (contract.endpoint !== endpoint || contract.scope !== "mcp") {
             throw new Error("public contract endpoint or scope drifted");

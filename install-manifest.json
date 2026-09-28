@@ -1,15 +1,16 @@
 {
   "schemaVersion": 1,
-  "distributionVersion": "1.0.1",
+  "distributionVersion": "1.1.0",
   "repository": "https://github.com/Quriov/Quriov-MCP",
-  "releaseTag": "v1.0.1",
+  "releaseTag": "v1.1.0",
   "commitPinSource": "website_prompt",
   "manifestHashAlgorithm": "sha256",
   "manifestHashSource": "website_prompt",
   "endpoint": "https://quriovai.com/mcp/v1",
   "scope": "mcp",
   "allowedNetworkTargets": [
-    "https://quriovai.com/mcp/v1"
+    "https://quriovai.com/mcp/v1",
+    "https://quriovai.com/api/v1/mcp/uploads"
   ],
   "doctor": {
     "entrypoint": "bin/quriov-mcp-doctor.mjs",
@@ -19,6 +20,29 @@
       "QURIOV_MCP_ACCESS_KEY"
     ],
     "writesConfiguration": false
+  },
+  "cli": {
+    "entrypoint": "bin/quriov.mjs",
+    "guide": "CLI.md",
+    "minimumNodeVersion": "20",
+    "dependencies": [],
+    "credentialInputs": [
+      "QURIOV_MCP_ACCESS_KEY",
+      "QURIOV_MCP_KEY",
+      "QURIOV_ACCESS_KEY",
+      "stdin",
+      "quriov login user config file"
+    ],
+    "networkTargets": [
+      "https://quriovai.com/mcp/v1",
+      "https://quriovai.com/api/v1/mcp/uploads"
+    ],
+    "resultDownloads": "presigned https URLs returned by the MCP tools, fetched with GET and without the key",
+    "writes": [
+      "its own credentials file under the user config directory (quriov login)",
+      "batch outputs, cost.csv and .quriov/ state under the chosen output folder"
+    ],
+    "spendsCredit": "only after a server-side estimate and explicit confirmation (--yes when non-interactive)"
   },
   "clients": {
     "codex": {
@@ -38,10 +62,11 @@
     }
   },
   "files": {
-    "AGENTS.md": "c65aa1f6ee23f5114bffefc5db757fed093e732405ffa8fbc5432f00bdb6c1a7",
+    "AGENTS.md": "fede57154f1dbdd4bcc866215dc7cdfb472da4edfcbe5ecb438f31720b3a09d6",
     "recipes/codex.md": "fffa137890471d327e2791162fbc67dae518a4b571cf709177320f0b4a3e22e1",
     "recipes/claude-code.md": "f317b1a8f30ea6d4f789c79fd7681a2b791a2fdf3952eb7e0d6b8efc56a963be",
     "recipes/cursor.md": "a48685a7ef1c729d3f128489a59773b44795baf676c1459c167be9c785e9db76",
-    "bin/quriov-mcp-doctor.mjs": "d1b21cfacaf83f4cb1277d5d70a702a315543e8edbc147745c8470c4d11c6d41"
+    "bin/quriov-mcp-doctor.mjs": "d1b21cfacaf83f4cb1277d5d70a702a315543e8edbc147745c8470c4d11c6d41",
+    "bin/quriov.mjs": "9c40eac457f3da9a2d04012ddf6f4abc23f99cf08ba6648d9615755d3accc435"
   }
 }

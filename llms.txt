@@ -25,6 +25,20 @@ recipes/cursor.md
 bin/quriov-mcp-doctor.mjs
   Read-only initialize, exact tools/list, and redacted get_account validation.
 
+bin/quriov.mjs
+  Official zero-dependency CLI (Chinese UI): login, account, models, gen, and
+  batch plan/run/status/resume with local reference upload, pacing, polling,
+  downloads, per-job cost list from API responses, and resumable state.
+
+CLI.md
+  Chinese CLI guide with the 20 products x 9 images example.
+
+examples/products.csv
+  Example batch spec (sku, refs, templates, prompt, model, aspect_ratio, n).
+
+test/quriov-cli.test.mjs
+  CLI tests with a mocked HTTP layer: submit, poll, download, resume, errors.
+
 test/quriov-mcp-doctor.test.mjs
   Doctor protocol, redaction, fail-closed, and argument-safety tests.
 
@@ -36,3 +50,6 @@ https://quriovai.com/mcp
 
 https://quriovai.com/mcp/v1
   The only allowed remote MCP endpoint. Requires a revocable scope=mcp key.
+
+https://quriovai.com/api/v1/mcp/uploads
+  Reference-image upload used by the CLI (multipart field "file", same key).

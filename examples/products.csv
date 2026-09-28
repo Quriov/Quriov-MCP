@@ -1,0 +1,3 @@
+sku,refs,templates,prompt,model,aspect_ratio,n
+A001,refs/A001-front.jpg;refs/A001-side.jpg,main_image;tk_main_image;infographic_1,红色 316 不锈钢保温杯 500ml，磨砂杯身，银色杯盖,gpt-image-2.5-2K,,1
+A002,refs/A002.jpg,main_image;tk_main_image;infographic_1,蓝色高硼硅玻璃水杯 350ml，带竹木杯盖,gpt-image-2.5-2K,,1
