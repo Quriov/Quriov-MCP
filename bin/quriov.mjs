@@ -70,13 +70,13 @@ export {
   parseToolError,
 };
 
-// 钥匙的环境变量：第一个是正式名字；后三个是以前在不同地方出现过的名字，照认，已经配好的人不用重配。
-export const KEY_ENV_NAMES = Object.freeze([
-  "QURIOV_API_KEY",
-  "QURIOV_MCP_ACCESS_KEY",
-  "QURIOV_MCP_KEY",
-  "QURIOV_ACCESS_KEY",
-]);
+// 钥匙的环境变量：QURIOV_API_KEY 是正式名字；另外三个是以前在不同地方出现过的旧名字，照认。
+// 优先级：QURIOV_API_KEY > quriov setup 保存的钥匙 > 旧名字。旧名字里常留着别的（甚至已作废的）钥匙，
+// 不能盖过刚用 setup 存下、验证过的那把。
+export const PRIMARY_KEY_ENV = "QURIOV_API_KEY";
+export const LEGACY_KEY_ENV_NAMES = Object.freeze(["QURIOV_MCP_ACCESS_KEY", "QURIOV_MCP_KEY", "QURIOV_ACCESS_KEY"]);
+export const KEY_ENV_NAMES = Object.freeze([PRIMARY_KEY_ENV, ...LEGACY_KEY_ENV_NAMES]);
+export const SAVED_KEY_SOURCE = "quriov setup 保存的钥匙";
 
 export const DEFAULT_CONCURRENCY = 4; // 每个组织同时出图 4 张，再多只是在服务端排队
 export const DEFAULT_POLL_SECONDS = 15;
@@ -110,25 +110,32 @@ export function credentialsPath(options) {
   return join(configDir(options), "credentials.json");
 }
 
-export function resolveKey({ env = process.env, readFile = readFileSync, path, home, platform } = {}) {
-  for (const name of KEY_ENV_NAMES) {
-    const value = (env[name] ?? "").trim();
-    if (value) return { key: value, source: `环境变量 ${name}` };
-  }
+// 所有能找到的钥匙，按优先级排好、去掉重复的；第一把是要用的，其余是它没通过验证时的备选。
+export function resolveKeys({ env = process.env, readFile = readFileSync, path, home, platform } = {}) {
+  const found = [];
+  const add = (key, source) => {
+    const value = (key ?? "").trim();
+    if (value && !found.some((f) => f.key === value)) found.push({ key: value, source });
+  };
+  add(env[PRIMARY_KEY_ENV], `环境变量 ${PRIMARY_KEY_ENV} 的钥匙`);
   const file = path ?? credentialsPath({ env, home, platform });
   try {
     const stored = JSON.parse(readFile(file, "utf8"));
-    if (typeof stored?.key === "string" && stored.key.trim()) {
-      return { key: stored.key.trim(), source: "quriov setup 保存的钥匙" };
-    }
+    if (typeof stored?.key === "string") add(stored.key, SAVED_KEY_SOURCE);
   } catch {
-    // 没配置过：落到下面的报错
+    // 没配置过
   }
-  return null;
+  for (const name of LEGACY_KEY_ENV_NAMES) add(env[name], `环境变量 ${name} 的钥匙`);
+  return found;
+}
+
+export function resolveKey(options) {
+  return resolveKeys(options)[0] ?? null;
 }
 
 export function requireKey(options) {
   const found = resolveKey(options);
+  if (found) found.fallbacks = resolveKeys(options).slice(1);
   if (!found) {
     throw new CliError(
       "missing_key",
@@ -1155,9 +1162,11 @@ export async function main(argv, io = {}) {
   }
 
   const makeClient = () => {
-    const { key } = requireKey(where);
+    const { key, source, fallbacks } = requireKey(where);
     return new QuriovClient({
       key,
+      keySource: source,
+      fallbacks,
       fetchImpl,
       sleep,
       now,
@@ -1203,6 +1212,18 @@ export async function main(argv, io = {}) {
     return all.filter((t) => wanted.includes(t.id)).map((t) => ({ ...t, installed: true }));
   };
 
+  // 第一把钥匙没通过、换成下一把才成功：提醒用户删掉那个失效的来源（多半是 shell 里的旧环境变量）。
+  function staleKeyHint(client) {
+    for (const source of client.rejectedSources ?? []) {
+      const name = /环境变量 (\S+) 的钥匙/.exec(source ?? "")?.[1];
+      log(
+        name
+          ? `注意：环境变量 ${name} 里的钥匙没通过验证，这次改用了${client.keySource}。请从 shell 配置里删掉 ${name}（或换成有效的钥匙），不然以后还会先用它。`
+          : `注意：${source}没通过验证，这次改用了${client.keySource}。`,
+      );
+    }
+  }
+
   if (command === "setup" || command === "login") {
     const dryRun = Boolean(args.dryRun);
     // --dry-run 不联网、不写文件，用不到钥匙；除非明确说了从标准输入给。
@@ -1241,7 +1262,7 @@ export async function main(argv, io = {}) {
       return 0;
     }
 
-    const client = new QuriovClient({ key, fetchImpl, sleep, now, log });
+    const client = new QuriovClient({ key, keySource: "刚输入的钥匙", fetchImpl, sleep, now, log });
     const account = await client.account(); // 先验证再写任何东西：错的钥匙不落盘
     const file = saveKey(key, where);
     print(`钥匙可用（${walletLabel(account)}），已保存到 ${file}`);
@@ -1265,7 +1286,7 @@ export async function main(argv, io = {}) {
     if (!active.length) {
       print("本机没发现 Claude Code / Codex / Cursor：命令行已经能用；装了客户端后重跑 quriov setup，或用 --client 指定。");
     }
-    const result = await runDoctor({ client, key, targets });
+    const result = await runDoctor({ client, targets });
     print("");
     print("自检：");
     print(renderDoctor(result));
@@ -1278,10 +1299,11 @@ export async function main(argv, io = {}) {
   }
 
   if (command === "doctor") {
-    const { key } = requireKey(where);
-    const client = new QuriovClient({ key, fetchImpl, sleep, now, log });
-    const result = await runDoctor({ client, key, targets: clientTargets(where) });
+    const { key, source, fallbacks } = requireKey(where);
+    const client = new QuriovClient({ key, keySource: source, fallbacks, fetchImpl, sleep, now, log });
+    const result = await runDoctor({ client, targets: clientTargets(where) });
     print(renderDoctor(result));
+    staleKeyHint(client);
     return result.ok ? 0 : 1;
   }
 
@@ -1325,6 +1347,8 @@ export async function main(argv, io = {}) {
       return 0;
     }
     print(`余额：${a.balance} 点（${walletLabel(a)}）`);
+    print(`正在用${client.keySource}。`);
+    staleKeyHint(client);
     if (a.quota && a.quota.daily_generation_remaining !== undefined && a.quota.daily_generation_remaining !== null) {
       print(`今天还能提交 ${a.quota.daily_generation_remaining} 次（${a.quota.resets_at ?? "零点"} 重置）`);
     }
