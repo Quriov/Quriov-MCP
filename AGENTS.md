@@ -7,7 +7,7 @@
 - 仓里不许有真钥匙或任何凭据（测试用明显是假的值）。
 - 钥匙不进命令参数、链接、日志、输出、批次存档（`.quriov/*.json`、`cost.csv`）；下载结果图时不带钥匙。
 - 只连 `https://quriovai.com`（所有地址从 `lib/common.mjs` 的 `ORIGIN` 拼）和服务端返回的 https 结果链接。
-- 和服务端说话只走 `lib/transport.mjs`；以后换成直连接口时只改这个文件。
+- 和服务端说话只走 `lib/transport.mjs`（MCP 和直连接口 `/api/v1/mcp/*` 都在这里）；批量提交 / 任务查询的命令在 `lib/batch.mjs`。报错一律带中文原因、错误码、请求编号；只自动重试 503。
 - `quriov setup` / `uninstall` 只动 Claude Code、Codex、Cursor 三个客户端的用户级配置里名为 `quriov` 的那一项和 `<技能目录>/quriov/`；解析不了的文件不碰；测试一律用假的用户目录（`main(..., { home })`），绝不碰真的 `~`。
 - 花钱前先拿服务端估价并确认（非交互要 `--yes`）；点数只用服务端返回的数，不内置价目表。
 - 自检只查核心工具在不在，不比工具总数；文档和技能里不写死工具总数、服务端限额数字、版本号（版本号只在 `package.json`）。

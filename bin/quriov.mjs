@@ -31,8 +31,11 @@ import {
   ORIGIN,
   UPLOAD_ENDPOINT,
   VERSION,
+  EXT_BY_TYPE,
   describeError,
+  errorPayload,
   realSleep,
+  safeName,
   sha256,
   writeAtomic,
 } from "../lib/common.mjs";
@@ -54,8 +57,10 @@ import {
   skillDirsFor,
   writeClientConfig,
 } from "../lib/setup.mjs";
+import { batchStatusCommand, batchSubmitCommand, jobsCommand } from "../lib/batch.mjs";
 
 export {
+  safeName,
   CliError,
   CORE_TOOLS,
   MCP_ENDPOINT,
@@ -84,12 +89,6 @@ const UNKNOWN_GIVE_UP_MS = 10 * 60 * 1000;
 const MISSING_GIVE_UP_POLLS = 8;
 const MAX_DOWNLOAD_ATTEMPTS = 3;
 const STATE_DIR = ".quriov";
-const EXT_BY_TYPE = Object.freeze({
-  "image/png": ".png",
-  "image/jpeg": ".jpg",
-  "image/webp": ".webp",
-  "video/mp4": ".mp4",
-});
 const TERMINAL_OK = new Set(["succeeded", "partial"]);
 
 // ---------------------------------------------------------------------------
@@ -163,18 +162,6 @@ export function saveKey(key, { path, env = process.env, home, platform } = {}) {
 // 小工具
 // ---------------------------------------------------------------------------
 
-
-// Windows 文件名里不能有的字符、结尾不能是点或空格、不能叫 CON 之类。
-export function safeName(raw) {
-  let name = String(raw ?? "")
-    .normalize("NFC")
-    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_")
-    .replace(/[. ]+$/g, "")
-    .trim();
-  if (!name) name = "_";
-  if (/^(con|prn|aux|nul|com\d|lpt\d)(\..*)?$/i.test(name)) name = `_${name}`;
-  return name.slice(0, 120);
-}
 
 function formatCredits(value) {
   if (value === null || value === undefined || value === "") return "";
@@ -921,6 +908,17 @@ const FLAG_SPEC = Object.freeze({
   "--concurrency": "concurrency",
   "--poll-seconds": "pollSeconds",
   "--client": "client",
+  "--batch-key": "batchKey",
+  "--chunk-size": "chunkSize",
+  "--download": "download",
+  "--timeout": "timeout",
+  "--status": "status",
+  "--tag": "tag",
+  "--batch": "batch",
+  "--since": "since",
+  "--until": "until",
+  "--limit": "limit",
+  "--cursor": "cursor",
 });
 const BOOLEAN_FLAGS = Object.freeze({
   "--yes": "yes",
@@ -929,6 +927,8 @@ const BOOLEAN_FLAGS = Object.freeze({
   "--estimate": "estimate",
   "--json": "json",
   "--retry-failed": "retryFailed",
+  "--wait": "wait",
+  "--all": "all",
   "--help": "help",
   "-h": "help",
   "--version": "version",
@@ -1017,12 +1017,30 @@ export const HELP = `Quriov 官方命令行 ${VERSION} —— 和 Quriov MCP 同
   quriov batch resume <批次号|输出目录> [--retry-failed] [--yes]
                                  断了接着跑；已提交的用原任务编号，不会重复扣钱
 
+批量（整批交给服务端；条目里是参考图链接，适合 AI / 脚本）
+  quriov batch submit <条目.jsonl|条目.json|-> [--dry-run] [--yes] [--batch-key <键>] [--json]
+                                 每条：model、prompt，可选 template_ids(≤8)、reference_urls、
+                                 aspect_ratio、n(1-4)、tag、idempotency_key（不填自动按内容算，
+                                 同一个文件重跑不会重复扣钱）；先估价再确认，每次最多 50 条分组交
+                                 [--chunk-size 1-50]
+  quriov batch status <批次号> [--wait] [--download 目录] [--poll-seconds 15] [--timeout 180] [--json]
+                                 --wait 等到全部结束；--download 按 标记/模板 命名下载结果图
+
+任务（按任务号查 / 翻历史 / 取消）
+  quriov jobs get <任务号> [--json]
+  quriov jobs list [--status s] [--tag t] [--model m] [--batch 批次号] [--since 时间] [--until 时间]
+                   [--limit 1-100] [--cursor c] [--all] [--json]
+  quriov jobs query <任务号...|-> [--json]      一次查多个（- = 从标准输入读）
+  quriov jobs cancel <任务号> [--json]          只有还在排队的能取消（不扣费）
+
 表格列（第一行是表头；中文表头也认）
   sku 货号 · refs 参考图（分号隔开，相对表格所在文件夹）· templates 模板（分号隔开，
   每个模板 = 一个图位）· prompt 提示词 · model 模型 · aspect_ratio 比例 · n 每个图位几张（1-4）
   文件夹模式：每个子文件夹是一个商品，里面的图当参考图，可放 prompt.txt；用 --templates 指定图位。
 
-退出码：0 全部完成 · 1 出错 · 2 用法不对 · 3 有任务失败 · 4 暂停（余额不足 / 网络 / 服务端临时故障），可 resume
+--json：给 AI / 脚本读的输出；出错时标准输出也是 {"error": {error_code, reason, request_id}}。
+
+退出码：0 全部完成 · 1 出错 · 2 用法不对 · 3 有任务失败 / 被拒 / 查不到 · 4 暂停（余额不足 / 网络 / 服务端临时故障 / 等待超时），可再跑
 `;
 
 async function readSecret(prompt, { stdin = process.stdin, stderr = process.stderr, piped = false } = {}) {
@@ -1495,8 +1513,21 @@ export async function main(argv, io = {}) {
       return execute(state, client, pre.templateAspect);
     }
 
+    if (sub === "submit") {
+      return batchSubmitCommand(rest[0], args, { makeClient, print, log, stdin, confirm: (q) => confirm(q, { stdin, stderr }) });
+    }
+
     if (sub === "status") {
-      const state = findState(rest[0] ?? ".", where);
+      // 本机按表跑的批次（batch run）看本机记录；其余当作服务端批次号（batch submit 打印的）。
+      let state = null;
+      if (!args.wait && !args.download) {
+        try {
+          state = findState(rest[0] ?? ".", where);
+        } catch (error) {
+          if (error.code !== "batch_not_found" || !rest[0]) throw error;
+        }
+      }
+      if (!state) return batchStatusCommand(rest[0], args, { makeClient, print, log, sleep, now, shouldStop });
       if (args.json) {
         print(JSON.stringify({ batchId: state.batchId, counts: statusCounts(state), credits: sumCredits(state.jobs.map((j) => j.credits)), pausedUntil: state.pausedUntil, jobs: state.jobs.map(({ args: _a, ...job }) => job) }));
         return 0;
@@ -1537,7 +1568,11 @@ export async function main(argv, io = {}) {
       return execute(state, client, state.templateAspect ?? {});
     }
 
-    throw new CliError("usage", "batch 后面要跟 plan / run / status / resume。运行 quriov --help 看用法。", { exitCode: 2 });
+    throw new CliError("usage", "batch 后面要跟 plan / run / status / resume / submit。运行 quriov --help 看用法。", { exitCode: 2 });
+  }
+
+  if (command === "jobs") {
+    return jobsCommand(sub, rest, args, { makeClient, print, log, stdin });
   }
 
   throw new CliError("usage", `不认识的命令 ${command}。运行 quriov --help 看用法。`, { exitCode: 2 });
@@ -1553,8 +1588,11 @@ async function cli() {
   try {
     process.exitCode = await main(process.argv.slice(2), { shouldStop: () => stopRequested });
   } catch (error) {
+    const wantsJson = process.argv.slice(2).includes("--json");
     if (error instanceof CliError) {
       process.stderr.write(`错误：${error.message}\n`);
+      // 给 AI / 脚本：--json 时标准输出也给一份机器读的报错（已经打印过部分结果的除外）
+      if (wantsJson && !error.jsonPrinted) process.stdout.write(`${JSON.stringify(errorPayload(error))}\n`);
       process.exitCode = error.exitCode;
     } else {
       // 不把原始异常（可能带请求细节）直接甩给用户
