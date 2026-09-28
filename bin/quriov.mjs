@@ -1,66 +1,92 @@
 #!/usr/bin/env node
 // Quriov 官方命令行。零依赖（Node 20+ 自带的 fetch / FormData / fs）。
 //
-// 它和 Quriov MCP 用同一把钥匙、打同一个后端：出图 / 查询 / 估价 / 账户走公开的
-// MCP 入口（下面 MCP_ENDPOINT），本地参考图上传走 UPLOAD_ENDPOINT。
-// 扣点、失败退款、限流、出图记录全部在服务端，这里只做本机的事：读图上传、按表提交、
-// 控速、轮询、下载到文件夹、写出每张花了多少点、断了能接着跑。
+// 和 Quriov MCP 用同一把钥匙、打同一个后端。扣点、失败退款、出图记录全部在服务端；这里只做本机的事：
+// 一条命令装好（setup：验钥匙、写 MCP 配置、装技能、自检）、读图上传、按表提交、轮询、
+// 下载到文件夹、写出每张花了多少点、断了能接着跑。
 //
-// 安全边界（见 AGENTS.md）：钥匙永远不从命令行参数读、不打印、不写进日志和状态文件；
-// 下载结果图时【不带】钥匙；只连上面两个固定地址和它们返回的 https 结果链接。
+// 模块：lib/transport.mjs 是和服务端说话的唯一出口；lib/setup.mjs 管客户端配置、技能和自检。
+// 安全边界（见 AGENTS.md）：钥匙永远不从命令行参数读、不打印、不写进日志和批次状态文件。
 
-import { createHash, randomBytes } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
-  renameSync,
   statSync,
-  writeFileSync,
   chmodSync,
   rmSync,
   realpathSync,
 } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { PROTOCOL_VERSION, runDoctor } from "./quriov-mcp-doctor.mjs";
+import {
+  CliError,
+  INSTALL_DOC_URL,
+  KEYS_PAGE_URL,
+  MCP_ENDPOINT,
+  ORIGIN,
+  UPLOAD_ENDPOINT,
+  VERSION,
+  describeError,
+  realSleep,
+  sha256,
+  writeAtomic,
+} from "../lib/common.mjs";
+import {
+  DEFAULT_REQUESTS_PER_MINUTE,
+  IMAGE_EXTENSIONS,
+  MAX_UPLOAD_BYTES,
+  QuriovClient,
+  RequestBudget,
+  parseToolError,
+} from "../lib/transport.mjs";
+import {
+  CORE_TOOLS,
+  checkKeyShape,
+  clientTargets,
+  installSkill,
+  removeClientConfig,
+  removeSkill,
+  renderDoctor,
+  runDoctor,
+  skillDirsFor,
+  writeClientConfig,
+} from "../lib/setup.mjs";
 
-export const VERSION = "1.1.1";
-export const ORIGIN = "https://quriovai.com";
-export const MCP_ENDPOINT = `${ORIGIN}/mcp/v1`;
-export const UPLOAD_ENDPOINT = `${ORIGIN}/api/v1/mcp/uploads`;
-export const USER_AGENT = `quriov-cli/${VERSION} (+https://github.com/Quriov/Quriov-MCP)`;
+export {
+  CliError,
+  CORE_TOOLS,
+  MCP_ENDPOINT,
+  ORIGIN,
+  QuriovClient,
+  RequestBudget,
+  UPLOAD_ENDPOINT,
+  VERSION,
+  describeError,
+  parseToolError,
+};
 
-// 同一把钥匙在不同地方出现过三个名字（网页手工配置 / 网页「复制给 AI」/ 旧自检 skill）。
-// 第一个是正式名字；另外两个照认，已经配好的人不用重配。
+// 钥匙的环境变量：第一个是正式名字；后三个是以前在不同地方出现过的名字，照认，已经配好的人不用重配。
 export const KEY_ENV_NAMES = Object.freeze([
+  "QURIOV_API_KEY",
   "QURIOV_MCP_ACCESS_KEY",
   "QURIOV_MCP_KEY",
   "QURIOV_ACCESS_KEY",
 ]);
 
-// 服务端现状（后端未改）：每把钥匙每分钟 30 次请求；MCP 每调一次工具，服务端要先验钥匙
-// 再干活 = 算 2 次。这里默认只用 26 次/分，给同一把钥匙在别处的零星调用留余量。
-export const DEFAULT_REQUESTS_PER_MINUTE = 26;
 export const DEFAULT_CONCURRENCY = 4; // 每个组织同时出图 4 张，再多只是在服务端排队
 export const DEFAULT_POLL_SECONDS = 15;
 export const MAX_IMAGES_PER_SUBMIT = 4;
 export const MAX_PROMPT_CHARS = 8000;
-export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 const UPLOAD_REUSE_MARGIN_MS = 2 * 3600 * 1000; // 参考图链接 24 小时有效；剩不到 2 小时就重传
 const UNKNOWN_GIVE_UP_MS = 10 * 60 * 1000;
 const MISSING_GIVE_UP_POLLS = 8;
 const MAX_DOWNLOAD_ATTEMPTS = 3;
 const STATE_DIR = ".quriov";
-const IMAGE_EXTENSIONS = Object.freeze({
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".png": "image/png",
-  ".webp": "image/webp",
-});
 const EXT_BY_TYPE = Object.freeze({
   "image/png": ".png",
   "image/jpeg": ".jpg",
@@ -70,74 +96,7 @@ const EXT_BY_TYPE = Object.freeze({
 const TERMINAL_OK = new Set(["succeeded", "partial"]);
 
 // ---------------------------------------------------------------------------
-// 报错：每一条都说清「到底是什么原因」和「下一步做什么」。
-// ---------------------------------------------------------------------------
-
-export class CliError extends Error {
-  constructor(code, message, { exitCode = 1, retryAfterSeconds = null, fatal = true } = {}) {
-    super(message);
-    this.name = "CliError";
-    this.code = code;
-    this.exitCode = exitCode;
-    this.retryAfterSeconds = retryAfterSeconds;
-    this.fatal = fatal;
-  }
-}
-
-// 服务端对外错误码（backend public_mcp.py _PUBLIC_ERRORS 白名单 + MCP 门面的状态码映射）。
-export const ERROR_MESSAGES = Object.freeze({
-  content_rejected: "内容审核没通过：提示词或参考图触发了内容政策，换个说法或换张图再试。",
-  insufficient_credits: "余额不足：账户点数不够这次出图，充值或换组织钱包后再跑。",
-  service_unavailable: "出图服务暂时不可用（服务端临时故障），稍后续跑即可，已提交的不会重复扣钱。",
-  generation_failed: "这次生成失败了（服务端没给更细的原因），可以用 --retry-failed 重试。",
-  invalid_request:
-    "请求被拒：模型、提示词或选项有一项不被接受（服务端目前不告诉具体是哪一项，常见原因：提示词为空或超过 8000 字）。",
-  invalid_media_encoding: "有一张参考图解不开（文件损坏或不是图片）。",
-  unsupported_media_format: "参考图格式不支持：只收 JPG、PNG、WebP。",
-  media_too_large: "参考图太大：单张不能超过 10 MB。",
-  invalid_media_reference: "参考图链接取不到了（上传链接 24 小时有效）。用 --retry-failed 重试会自动重新上传。",
-  too_many_media: "参考图张数超过这个模型的上限，减少几张再试。",
-  missing_required_media: "这个模型必须带参考图。",
-  invalid_options: "有选项这个模型不接受（比如画幅比例写法不对，应该像 1:1、3:4、9:16）。",
-  unknown_template: "模板编号不存在。用 quriov models 看这把钥匙能用的模板编号。",
-  invalid_batch_size: "张数只能是 1 到 4 的整数。",
-  unsupported_model: "模型不可用（可能写错或已下架）。用 quriov models 看现在能用的模型。",
-  validation_error: "请求参数不对（服务端没说是哪一项）。",
-  insufficient_scope: "这把钥匙用途不对：命令行要网页上用途为「MCP」的钥匙，不是「API 调用」钥匙。",
-  unauthorized: "钥匙没通过验证。",
-  idempotency_conflict:
-    "同一个任务编号被用在了内容不同的请求上（多半是状态文件被手改过）。用 --retry-failed 会换新编号重交。",
-  lost_from_history:
-    "在最近 50 条出图记录里找不到这条（同一把钥匙在别处提交得太多把它挤出去了；服务端暂时只能查最近 50 条）。结果如已生成，可在网页出图记录里找到。",
-  download_failed: "图已生成、已扣点，但下载失败。稍后运行 resume 会自动重下（结果云端只留 1 天）。",
-});
-
-export function describeError(code, fallback) {
-  return ERROR_MESSAGES[code] ?? fallback ?? `服务端返回错误：${code}`;
-}
-
-function unauthorizedError(everSucceeded) {
-  if (everSucceeded) {
-    return new CliError(
-      "rate_limited_as_401",
-      "服务端回了 401「需要登录」，但这把钥匙刚才还能用 —— 最可能是触发了每分钟请求上限（服务端目前把限流也报成 401）。已自动等过一分钟仍不行，请过几分钟再运行 resume。",
-      { exitCode: 4 },
-    );
-  }
-  return new CliError(
-    "unauthorized",
-    [
-      "钥匙没通过验证（HTTP 401）。服务端不区分具体原因，常见的有三种：",
-      "  1. 钥匙填错了或复制不全；",
-      "  2. 钥匙已在网页上撤销；",
-      "  3. 钥匙用途选成了「API 调用」—— 命令行和 MCP 要用途为「MCP」的钥匙。",
-      `到 ${ORIGIN}/me/access-keys 检查或新建一把，再运行 quriov login。`,
-    ].join("\n"),
-  );
-}
-
-// ---------------------------------------------------------------------------
-// 钥匙：环境变量（三个名字）→ quriov login 存下的文件。永远不从命令行参数读。
+// 钥匙：环境变量 → quriov setup 存下的文件。永远不从命令行参数读。
 // ---------------------------------------------------------------------------
 
 export function configDir({ env = process.env, platform = process.platform, home = homedir() } = {}) {
@@ -151,19 +110,19 @@ export function credentialsPath(options) {
   return join(configDir(options), "credentials.json");
 }
 
-export function resolveKey({ env = process.env, readFile = readFileSync, path } = {}) {
+export function resolveKey({ env = process.env, readFile = readFileSync, path, home, platform } = {}) {
   for (const name of KEY_ENV_NAMES) {
     const value = (env[name] ?? "").trim();
     if (value) return { key: value, source: `环境变量 ${name}` };
   }
-  const file = path ?? credentialsPath({ env });
+  const file = path ?? credentialsPath({ env, home, platform });
   try {
     const stored = JSON.parse(readFile(file, "utf8"));
     if (typeof stored?.key === "string" && stored.key.trim()) {
-      return { key: stored.key.trim(), source: "quriov login 保存的钥匙" };
+      return { key: stored.key.trim(), source: "quriov setup 保存的钥匙" };
     }
   } catch {
-    // 没登录过：落到下面的报错
+    // 没配置过：落到下面的报错
   }
   return null;
 }
@@ -174,10 +133,9 @@ export function requireKey(options) {
     throw new CliError(
       "missing_key",
       [
-        "没找到钥匙。二选一：",
-        "  1. 运行 quriov login，粘贴网页上建的「MCP」钥匙（隐藏输入，存在本机用户目录）；",
-        "  2. 设置环境变量 QURIOV_MCP_ACCESS_KEY（旧名字 QURIOV_MCP_KEY / QURIOV_ACCESS_KEY 也认）。",
-        `钥匙在 ${ORIGIN}/me/access-keys 创建。出于安全，钥匙不能写在命令参数里。`,
+        "没找到钥匙。运行 quriov setup，按提示粘贴网页上建的钥匙（输入不显示，存在本机用户目录）；",
+        "或设置环境变量 QURIOV_API_KEY。",
+        `钥匙在 ${KEYS_PAGE_URL} 创建。出于安全，钥匙不能写在命令参数里。`,
       ].join("\n"),
       { exitCode: 2 },
     );
@@ -185,10 +143,10 @@ export function requireKey(options) {
   return found;
 }
 
-export function saveKey(key, { path, env = process.env } = {}) {
-  const file = path ?? credentialsPath({ env });
+export function saveKey(key, { path, env = process.env, home, platform } = {}) {
+  const file = path ?? credentialsPath({ env, home, platform });
   mkdirSync(dirname(file), { recursive: true });
-  writeAtomic(file, `${JSON.stringify({ key, savedAt: new Date().toISOString() })}\n`);
+  writeAtomic(file, `${JSON.stringify({ key, savedAt: new Date().toISOString() })}\n`, { mode: 0o600 });
   try {
     chmodSync(file, 0o600);
   } catch {
@@ -201,17 +159,6 @@ export function saveKey(key, { path, env = process.env } = {}) {
 // 小工具
 // ---------------------------------------------------------------------------
 
-function writeAtomic(file, content) {
-  const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  writeFileSync(tmp, content);
-  renameSync(tmp, file);
-}
-
-export function sha256(buffer) {
-  return createHash("sha256").update(buffer).digest("hex");
-}
-
-const realSleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 // Windows 文件名里不能有的字符、结尾不能是点或空格、不能叫 CON 之类。
 export function safeName(raw) {
@@ -249,331 +196,6 @@ function addDecimal(a, b) {
 
 export function sumCredits(values) {
   return values.filter((v) => v !== null && v !== undefined && v !== "").reduce(addDecimal, "0");
-}
-
-// ---------------------------------------------------------------------------
-// 和服务端说话：MCP JSON-RPC（固定 8 个工具）+ 参考图上传。
-// ---------------------------------------------------------------------------
-
-export class RequestBudget {
-  constructor({ perMinute = DEFAULT_REQUESTS_PER_MINUTE, now = Date.now, sleep = realSleep } = {}) {
-    this.perMinute = perMinute;
-    this.now = now;
-    this.sleep = sleep;
-    this.stamps = [];
-  }
-
-  async take(cost) {
-    for (;;) {
-      const t = this.now();
-      this.stamps = this.stamps.filter((s) => t - s < 60_000);
-      if (this.stamps.length + cost <= this.perMinute) {
-        for (let i = 0; i < cost; i += 1) this.stamps.push(t);
-        return;
-      }
-      const waitMs = 60_000 - (t - this.stamps[0]) + 50;
-      await this.sleep(Math.max(waitMs, 50));
-    }
-  }
-}
-
-function parseRpcBody(text, contentType) {
-  if (contentType.includes("text/event-stream") || text.startsWith("event:") || text.startsWith("data:")) {
-    for (const line of text.split(/\r?\n/)) {
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice(5).trim();
-      if (!data || data === "[DONE]") continue;
-      try {
-        return JSON.parse(data);
-      } catch {
-        // 下一行
-      }
-    }
-    return null;
-  }
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-// MCP 工具出错时，结果是 isError + 一段文字，文字里嵌着服务端的公开错误 JSON：
-//   Error executing tool generate_image: {"code":"rate_limited",...}
-export function parseToolError(result) {
-  const text = (result?.content ?? [])
-    .filter((item) => item?.type === "text" && typeof item.text === "string")
-    .map((item) => item.text)
-    .join("\n");
-  const start = text.indexOf("{");
-  if (start >= 0) {
-    try {
-      const parsed = JSON.parse(text.slice(start));
-      if (parsed && typeof parsed.code === "string") return parsed;
-    } catch {
-      // 落到下面
-    }
-  }
-  return { code: "service_unavailable", message: "unparseable tool error", retryable: true };
-}
-
-export class QuriovClient {
-  constructor({
-    key,
-    fetchImpl = globalThis.fetch,
-    sleep = realSleep,
-    now = Date.now,
-    requestsPerMinute = DEFAULT_REQUESTS_PER_MINUTE,
-    log = () => {},
-  }) {
-    if (!key) throw new CliError("missing_key", "内部错误：没有钥匙。", { exitCode: 2 });
-    this.key = key;
-    this.fetchImpl = fetchImpl;
-    this.sleep = sleep;
-    this.now = now;
-    this.log = log;
-    this.budget = new RequestBudget({ perMinute: requestsPerMinute, now, sleep });
-    this.everSucceeded = false;
-    this.initialized = false;
-    this.rpcId = 0;
-  }
-
-  async _post(url, init, { cost, label }) {
-    const maxAttempts = 4;
-    for (let attempt = 1; ; attempt += 1) {
-      await this.budget.take(cost);
-      let response;
-      try {
-        response = await this.fetchImpl(url, {
-          ...init,
-          headers: { ...init.headers, Authorization: `Bearer ${this.key}`, "User-Agent": USER_AGENT },
-          redirect: "error",
-          signal: AbortSignal.timeout(120_000),
-        });
-      } catch {
-        if (attempt < maxAttempts) {
-          this.log(`  网络请求失败（${label}），${attempt * 5} 秒后重试…`);
-          await this.sleep(attempt * 5000);
-          continue;
-        }
-        throw new CliError(
-          "network_error",
-          `连不上 ${ORIGIN}（${label}，已重试 ${maxAttempts} 次）。检查网络 / 代理后运行 resume 接着跑。`,
-          { exitCode: 4 },
-        );
-      }
-
-      if (response.status === 401) {
-        // 服务端把「钥匙无效」和「每分钟限流」都报成 401。钥匙之前用过 ⇒ 按限流等一分钟再试。
-        if (this.everSucceeded && attempt < 3) {
-          this.log("  服务端回 401（钥匙刚才还能用，多半是每分钟请求数到上限），等 65 秒后重试…");
-          await this.sleep(65_000);
-          continue;
-        }
-        throw unauthorizedError(this.everSucceeded);
-      }
-      if (response.status === 403) {
-        const body = await response.text().catch(() => "");
-        if (/error code:\s*1010/i.test(body)) {
-          throw new CliError(
-            "blocked_by_firewall",
-            "请求被网站防火墙拦下（Cloudflare 1010，按请求特征拦的，不是钥匙问题）。请把完整报错发给 Quriov 管理员。",
-          );
-        }
-        throw new CliError("insufficient_scope", describeError("insufficient_scope"));
-      }
-      if (response.status === 429 || response.status >= 500) {
-        if (attempt < maxAttempts) {
-          const retryAfter = Number(response.headers.get("retry-after"));
-          const waitS = Number.isFinite(retryAfter) && retryAfter > 0 && retryAfter <= 120 ? retryAfter : attempt * 10;
-          this.log(`  服务端忙（HTTP ${response.status}，${label}），${waitS} 秒后重试…`);
-          await this.sleep(waitS * 1000);
-          continue;
-        }
-        throw new CliError(
-          "service_unavailable",
-          `服务端连续返回 HTTP ${response.status}（${label}）。${describeError("service_unavailable")}`,
-          { exitCode: 4 },
-        );
-      }
-      return response;
-    }
-  }
-
-  async rpc(method, params) {
-    const id = (this.rpcId += 1);
-    const response = await this._post(
-      MCP_ENDPOINT,
-      {
-        method: "POST",
-        headers: {
-          Accept: "application/json, text/event-stream",
-          "Content-Type": "application/json",
-          "MCP-Protocol-Version": PROTOCOL_VERSION,
-        },
-        body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
-      },
-      // 每个打到 /mcp/v1 的请求服务端都先验一次钥匙；tools/call 另外再干一次活。
-      { cost: method === "tools/call" ? 2 : 1, label: params?.name ?? method },
-    );
-    const text = await response.text();
-    if (!response.ok) {
-      throw new CliError("http_error", `服务端返回 HTTP ${response.status}（${params?.name ?? method}）。`);
-    }
-    const body = parseRpcBody(text, response.headers.get("content-type") ?? "");
-    if (!body) throw new CliError("invalid_response", `服务端的回应看不懂（${params?.name ?? method}）。`);
-    if (body.error) {
-      throw new CliError(
-        "protocol_error",
-        `MCP 协议错误 ${body.error.code ?? ""}（${params?.name ?? method}）。可能是命令行版本太旧，升级后再试。`,
-      );
-    }
-    this.everSucceeded = true;
-    return body.result;
-  }
-
-  async initialize() {
-    if (this.initialized) return;
-    await this.rpc("initialize", {
-      protocolVersion: PROTOCOL_VERSION,
-      capabilities: {},
-      clientInfo: { name: "quriov-cli", version: VERSION },
-    });
-    this.initialized = true;
-  }
-
-  async callTool(name, args = {}) {
-    await this.initialize();
-    for (let attempt = 1; ; attempt += 1) {
-      const result = await this.rpc("tools/call", { name, arguments: args });
-      if (result?.isError !== true) {
-        if (result?.structuredContent && typeof result.structuredContent === "object") {
-          return result.structuredContent;
-        }
-        const text = (result?.content ?? []).find((c) => c?.type === "text")?.text;
-        try {
-          return JSON.parse(text);
-        } catch {
-          throw new CliError("invalid_response", `服务端的回应看不懂（${name}）。`);
-        }
-      }
-      const error = parseToolError(result);
-      const retryAfter = Number.isFinite(error.retry_after_seconds) ? error.retry_after_seconds : null;
-      if (error.code === "rate_limited") {
-        // 同一个码既表示「每分钟上限」（等 60 秒）也表示「今天的提交次数用完」（等到零点 UTC）。
-        if (retryAfter !== null && retryAfter > 120) {
-          throw new CliError(
-            "daily_quota_exhausted",
-            "今天的提交次数用完了（每人每天 100 次，按提交次数算，不按张数）。",
-            { exitCode: 4, retryAfterSeconds: retryAfter },
-          );
-        }
-        if (attempt < 4) {
-          const waitS = retryAfter ?? 60;
-          this.log(`  每分钟请求数到上限，${waitS} 秒后自动重试…`);
-          await this.sleep(waitS * 1000);
-          continue;
-        }
-        throw new CliError("rate_limited", "连续触发每分钟请求上限（每把钥匙 30 次/分）。几分钟后运行 resume。", {
-          exitCode: 4,
-        });
-      }
-      if (error.code === "service_unavailable" && attempt < 3) {
-        this.log(`  出图服务暂时不可用（${name}），${attempt * 15} 秒后重试…`);
-        await this.sleep(attempt * 15_000);
-        continue;
-      }
-      if (error.code === "unauthorized") throw unauthorizedError(false);
-      if (error.code === "insufficient_scope") throw new CliError("insufficient_scope", describeError("insufficient_scope"));
-      throw new CliError(error.code, describeError(error.code), { fatal: error.code === "insufficient_credits" });
-    }
-  }
-
-  capabilities() {
-    return this.callTool("list_capabilities");
-  }
-
-  account() {
-    return this.callTool("get_account");
-  }
-
-  estimate({ modelId, pricingUnit, units }) {
-    return this.callTool("estimate_cost", { model_id: modelId, pricing_unit: pricingUnit, units });
-  }
-
-  generateImage(args) {
-    return this.callTool("generate_image", args);
-  }
-
-  listGenerations() {
-    return this.callTool("list_generations");
-  }
-
-  async upload(filePath, { readFile = readFileSync } = {}) {
-    const type = IMAGE_EXTENSIONS[extname(filePath).toLowerCase()];
-    if (!type) {
-      throw new CliError("unsupported_media_format", `参考图 ${filePath} 不是 JPG / PNG / WebP。`, { fatal: false });
-    }
-    let bytes;
-    try {
-      bytes = readFile(filePath);
-    } catch {
-      throw new CliError("missing_reference", `读不到参考图 ${filePath}（路径不对或没有权限）。`, { fatal: false });
-    }
-    if (bytes.length > MAX_UPLOAD_BYTES) {
-      throw new CliError("media_too_large", `参考图 ${filePath} 有 ${(bytes.length / 1048576).toFixed(1)} MB，超过 10 MB 上限。`, {
-        fatal: false,
-      });
-    }
-    const form = new FormData();
-    form.append("file", new Blob([bytes], { type }), basename(filePath));
-    const response = await this._post(UPLOAD_ENDPOINT, { method: "POST", body: form }, { cost: 1, label: "上传参考图" });
-    if (response.status === 413) {
-      throw new CliError("media_too_large", `参考图 ${filePath} 超过 10 MB 上限。`, { fatal: false });
-    }
-    if (response.status === 415) {
-      throw new CliError("unsupported_media_format", `参考图 ${filePath} 不是真正的 JPG / PNG / WebP（按文件内容判断，改扩展名没用）。`, {
-        fatal: false,
-      });
-    }
-    if (!response.ok) {
-      throw new CliError("upload_failed", `参考图 ${filePath} 上传失败（HTTP ${response.status}）。`, { fatal: false });
-    }
-    const body = await response.json().catch(() => null);
-    if (typeof body?.url !== "string" || !body.url.startsWith("https://")) {
-      throw new CliError("invalid_response", "上传接口的回应看不懂。");
-    }
-    this.everSucceeded = true;
-    return { url: body.url, expiresIn: Number(body.expires_in) || 86400, sha256: sha256(bytes) };
-  }
-
-  // 下载结果图：只接受 https；【不带】钥匙（链接本身已签名）；只用 GET（链接按 GET 签名，HEAD 会 403）。
-  async download(url, destPath) {
-    if (typeof url !== "string" || !url.startsWith("https://")) {
-      throw new CliError("download_failed", "结果链接不是 https，拒绝下载。", { fatal: false });
-    }
-    let response;
-    try {
-      response = await this.fetchImpl(url, {
-        method: "GET",
-        headers: { "User-Agent": USER_AGENT },
-        redirect: "follow",
-        signal: AbortSignal.timeout(300_000),
-      });
-    } catch {
-      throw new CliError("download_failed", "下载结果图时网络出错。", { fatal: false });
-    }
-    if (!response.ok) {
-      throw new CliError("download_failed", `下载结果图失败（HTTP ${response.status}，链接可能过期，会重新取链接）。`, {
-        fatal: false,
-      });
-    }
-    const bytes = Buffer.from(await response.arrayBuffer());
-    if (bytes.length === 0) throw new CliError("download_failed", "下载到的文件是空的。", { fatal: false });
-    mkdirSync(dirname(destPath), { recursive: true });
-    writeAtomic(destPath, bytes);
-    return bytes.length;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -806,16 +428,16 @@ export function renderPlan(jobs, { estimate = null } = {}) {
       lines.push(`  估价：${row.model} × ${row.images} 张 = ${row.credits} 点（服务端按这把钥匙所属账号估算）`);
     }
     lines.push(`  合计约 ${estimate.total} 点；当前余额 ${estimate.balance ?? "未知"} 点。`);
-    if (estimate.quota) {
-      lines.push(
-        `  今天还能提交 ${estimate.quota.daily_generation_remaining} 次（上限 ${estimate.quota.daily_generation_limit} 次/天，${estimate.quota.resets_at} 重置）。`,
-      );
+    // 每日提交上限只在服务端还返回它时才提（服务端撤掉限额后这段自然不出现）。
+    const remaining = Number(estimate.quota?.daily_generation_remaining);
+    if (estimate.quota && Number.isFinite(remaining)) {
+      lines.push(`  今天还能提交 ${remaining} 次（${estimate.quota.resets_at ?? "零点"} 重置）。`);
+      if (s.submissions > remaining) {
+        lines.push(`  注意：这批要提交 ${s.submissions} 次，超过今天剩余次数；用完会自动暂停，重置后运行 resume 接着跑。`);
+      }
     }
   } else {
     lines.push("  没有联网估价。加 --estimate 可以联网估价（免费，不出图）。");
-  }
-  if (s.submissions > 100) {
-    lines.push(`  注意：这批要提交 ${s.submissions} 次，超过每人每天 100 次的上限；用完会自动暂停，第二天运行 resume 接着跑。`);
   }
   return lines.join("\n");
 }
@@ -1307,6 +929,7 @@ const FLAG_SPEC = Object.freeze({
   "--concurrency": "concurrency",
   "--poll-seconds": "pollSeconds",
   "--rpm": "rpm",
+  "--client": "client",
 });
 const BOOLEAN_FLAGS = Object.freeze({
   "--yes": "yes",
@@ -1330,7 +953,7 @@ export function parseArgv(argv) {
     if (FORBIDDEN_FLAGS.test(arg)) {
       throw new CliError(
         "forbidden_argument",
-        "出于安全，钥匙和服务地址不能写在命令参数里（会留在命令历史和进程列表里）。用 quriov login 或环境变量 QURIOV_MCP_ACCESS_KEY。",
+        "出于安全，钥匙和服务地址不能写在命令参数里（会留在命令历史和进程列表里）。用 quriov setup（按提示粘贴，或从标准输入 --key-stdin）或环境变量 QURIOV_API_KEY。",
         { exitCode: 2 },
       );
     }
@@ -1369,17 +992,25 @@ function intOption(value, name, { min, max, fallback }) {
 }
 
 export const HELP = `Quriov 官方命令行 ${VERSION} —— 和 Quriov MCP 同一把钥匙、同一个后端，适合批量出图。
+安装说明：${INSTALL_DOC_URL}
 
-一次性准备
-  quriov login                   粘贴网页上建的「MCP」钥匙（隐藏输入，存本机用户目录）
-                                 也可以直接设环境变量 QURIOV_MCP_ACCESS_KEY
-                                 （旧名字 QURIOV_MCP_KEY / QURIOV_ACCESS_KEY 也认）
-  quriov logout                  删掉本机保存的钥匙（网页上的钥匙不受影响）
-  quriov doctor                  只读自检：连得上、8 个工具齐全、钥匙可用
+装好 / 检查 / 卸载
+  quriov setup                   粘贴网页上建的钥匙（输入不显示）；验证钥匙、存本机、
+                                 给本机的 Claude Code / Codex / Cursor 写好 MCP、装技能、自检
+         [--key-stdin]           钥匙从标准输入读（给 AI / 脚本用）
+         [--client claude,codex,cursor]  只配这几个客户端（默认：本机装了的都配）
+         [--dry-run]             只列出会改哪些文件，什么都不写
+  quriov doctor                  只读自检：钥匙、MCP、客户端配置、技能
+  quriov uninstall [--dry-run]   删掉三个客户端里的 quriov 配置、技能和本机保存的钥匙
+  quriov logout                  只删本机保存的钥匙（网页上的钥匙不受影响）
+  也可以不 setup，直接设环境变量 QURIOV_API_KEY
 
 查看（免费）
-  quriov account                 余额、今天还能提交几次
+  quriov account                 余额
   quriov models                  能用的模型、模板编号、每张多少点
+
+参考图
+  quriov upload <图...>          上传本地参考图，打印 24 小时有效的链接（给 MCP 的 input_media 用）
 
 单张 / 小批
   quriov gen -m <模型> -p "<提示词>" [--ref a.jpg --ref b.jpg] [-t <模板>] [-n 1-4]
@@ -1397,14 +1028,10 @@ export const HELP = `Quriov 官方命令行 ${VERSION} —— 和 Quriov MCP 同
 
 表格列（第一行是表头；中文表头也认）
   sku 货号 · refs 参考图（分号隔开，相对表格所在文件夹）· templates 模板（分号隔开，
-  每个模板 = 一个图位）· prompt 提示词 · model 模型 · aspect_ratio 比例 · n 每个图位几张
+  每个模板 = 一个图位）· prompt 提示词 · model 模型 · aspect_ratio 比例 · n 每个图位几张（1-4）
   文件夹模式：每个子文件夹是一个商品，里面的图当参考图，可放 prompt.txt；用 --templates 指定图位。
 
-现在的服务端限制（命令行会自动控速）
-  每把钥匙每分钟 30 次请求（每次工具调用算 2 次）；每人每天 100 次提交（按次不按张）；
-  一次提交最多 4 张、一个模板。
-
-退出码：0 全部完成 · 1 出错 · 2 用法不对 · 3 有任务失败 · 4 暂停（限额 / 网络），可 resume
+退出码：0 全部完成 · 1 出错 · 2 用法不对 · 3 有任务失败 · 4 暂停（服务端限额 / 网络），可 resume
 `;
 
 async function readSecret(prompt, { stdin = process.stdin, stderr = process.stderr, piped = false } = {}) {
@@ -1509,7 +1136,10 @@ export async function main(argv, io = {}) {
     sleep = realSleep,
     now = Date.now,
     shouldStop = () => false,
+    home = homedir(),
+    platform = process.platform,
   } = io;
+  const where = { env, home, platform };
   const print = (text) => stdout.write(`${text}\n`);
   const log = (text) => stderr.write(`${text}\n`);
   const args = parseArgv(argv);
@@ -1525,7 +1155,7 @@ export async function main(argv, io = {}) {
   }
 
   const makeClient = () => {
-    const { key } = requireKey({ env });
+    const { key } = requireKey(where);
     return new QuriovClient({
       key,
       fetchImpl,
@@ -1557,28 +1187,133 @@ export async function main(argv, io = {}) {
     return exitCodeFor(state, result);
   };
 
-  if (command === "login") {
-    const key = await readSecret("粘贴 Quriov MCP 钥匙（输入不显示），回车确认：", { stdin, stderr, piped: args.keyStdin });
-    if (!key) throw new CliError("missing_key", "没有输入钥匙。", { exitCode: 2 });
-    const client = new QuriovClient({ key, fetchImpl, sleep, now, log });
-    const account = await client.account(); // 先验证再保存：错的钥匙不落盘
-    const file = saveKey(key, { env });
-    print(`钥匙可用（${account.wallet_type === "organization" ? "组织钱包" : "个人账户"}），已保存到 ${file}。`);
-    print("下次直接用 quriov 命令即可；要删掉运行 quriov logout。");
-    return 0;
-  }
+  const walletLabel = (account) => (account?.wallet_type === "organization" ? "组织钱包" : "个人账户");
+  const selectTargets = () => {
+    const all = clientTargets(where);
+    if (!args.client) return all;
+    const wanted = String(args.client)
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    const unknown = wanted.filter((id) => !all.some((t) => t.id === id));
+    if (unknown.length) {
+      throw new CliError("usage", `--client 只认 claude、codex、cursor（逗号隔开），不认识：${unknown.join("、")}。`, { exitCode: 2 });
+    }
+    // 指名的客户端即使没检测到也照配（比如刚装、还没打开过）。
+    return all.filter((t) => wanted.includes(t.id)).map((t) => ({ ...t, installed: true }));
+  };
 
-  if (command === "logout") {
-    const file = credentialsPath({ env });
-    if (existsSync(file)) rmSync(file);
-    print(`已删除本机保存的钥匙（${file}）。网页上的钥匙不受影响，要作废请到 ${ORIGIN}/me/access-keys 撤销。`);
+  if (command === "setup" || command === "login") {
+    const dryRun = Boolean(args.dryRun);
+    // --dry-run 不联网、不写文件，用不到钥匙；除非明确说了从标准输入给。
+    let key =
+      dryRun && !args.keyStdin
+        ? ""
+        : await readSecret("粘贴 Quriov 钥匙（输入不显示；直接回车沿用本机已保存的），回车确认：", {
+            stdin,
+            stderr,
+            piped: args.keyStdin,
+          });
+    if (!key) {
+      const existing = resolveKey(where);
+      if (existing) {
+        key = existing.key;
+        print(`没有输入新钥匙，沿用${existing.source}。`);
+      } else if (!dryRun) {
+        throw new CliError("missing_key", `没有输入钥匙。钥匙在 ${KEYS_PAGE_URL} 创建。`, { exitCode: 2 });
+      }
+    }
+    if (key) checkKeyShape(key);
+    const targets = selectTargets();
+    const active = targets.filter((t) => t.installed);
+
+    if (dryRun) {
+      print("（--dry-run：只列出会做什么，没有联网，什么都没写）");
+      print(`  存钥匙 → ${credentialsPath(where)}`);
+      for (const t of targets) {
+        if (!t.installed) print(`  ${t.name}：本机没发现，跳过`);
+        else {
+          const r = writeClientConfig(t, key ?? "dry-run-placeholder-key", { dryRun: true });
+          print(r.status === "skipped" ? `  ${t.name}：会跳过（${r.reason}）→ ${t.config}` : `  ${t.name}：写入 MCP「quriov」→ ${t.config}`);
+        }
+      }
+      for (const d of skillDirsFor(active)) print(`  技能（${d.clients.join("、")}）→ ${installSkill(d.dir, { dryRun: true }).file}`);
+      return 0;
+    }
+
+    const client = new QuriovClient({ key, fetchImpl, sleep, now, log });
+    const account = await client.account(); // 先验证再写任何东西：错的钥匙不落盘
+    const file = saveKey(key, where);
+    print(`钥匙可用（${walletLabel(account)}），已保存到 ${file}`);
+    const problems = [];
+    for (const t of targets) {
+      if (!t.installed) {
+        print(`${t.name}：本机没发现，跳过`);
+        continue;
+      }
+      const r = writeClientConfig(t, key);
+      if (r.status === "written") print(`${t.name}：已写入 MCP「quriov」→ ${t.config}`);
+      else {
+        print(`${t.name}：没改（${r.reason}）→ ${t.config}`);
+        problems.push(t.name);
+      }
+    }
+    for (const d of skillDirsFor(active)) {
+      const r = installSkill(d.dir);
+      print(`技能（${d.clients.join("、")}）：已装到 ${r.file}`);
+    }
+    if (!active.length) {
+      print("本机没发现 Claude Code / Codex / Cursor：命令行已经能用；装了客户端后重跑 quriov setup，或用 --client 指定。");
+    }
+    const result = await runDoctor({ client, key, targets });
+    print("");
+    print("自检：");
+    print(renderDoctor(result));
+    if (!result.ok || problems.length) {
+      print("有没通过的项，按上面的提示处理后重跑 quriov setup。");
+      return 1;
+    }
+    print("全部通过。请新开一个会话（新会话才会加载 Quriov 的 MCP 和技能）。");
     return 0;
   }
 
   if (command === "doctor") {
-    const { key } = requireKey({ env });
-    const result = await runDoctor({ key, fetchImpl });
-    print(`连接正常：${result.endpoint}，工具 ${result.checks.tools.count} 个，钥匙可用。`);
+    const { key } = requireKey(where);
+    const client = new QuriovClient({ key, fetchImpl, sleep, now, log });
+    const result = await runDoctor({ client, key, targets: clientTargets(where) });
+    print(renderDoctor(result));
+    return result.ok ? 0 : 1;
+  }
+
+  if (command === "uninstall") {
+    const dryRun = Boolean(args.dryRun);
+    if (dryRun) print("（--dry-run：只列出会删什么，什么都没删）");
+    const targets = clientTargets(where);
+    for (const t of targets) {
+      const r = removeClientConfig(t, { dryRun });
+      if (r.status === "removed" || r.status === "planned") print(`${t.name}：${dryRun ? "会删" : "已删"} MCP「quriov」← ${t.config}`);
+      else if (r.status === "skipped") print(`${t.name}：没动（${r.reason}）← ${t.config}`);
+    }
+    for (const d of skillDirsFor(targets)) {
+      const r = removeSkill(d.dir, { dryRun });
+      if (r.status === "removed" || r.status === "planned") print(`技能：${dryRun ? "会删" : "已删"} ${r.file}`);
+      else if (r.status === "skipped") print(`技能：没动 ${r.file}（${r.reason}）`);
+    }
+    const file = credentialsPath(where);
+    if (existsSync(file)) {
+      if (!dryRun) rmSync(file);
+      print(`本机保存的钥匙：${dryRun ? "会删" : "已删"} ${file}`);
+    }
+    const envName = KEY_ENV_NAMES.find((name) => (env[name] ?? "").trim());
+    if (envName) print(`注意：环境变量 ${envName} 里还有钥匙，请自己从 shell 配置里删掉。`);
+    print(`命令行本身：npm uninstall -g quriov。钥匙要作废请到 ${KEYS_PAGE_URL} 撤销（卸载不会作废钥匙）。`);
+    return 0;
+  }
+
+  if (command === "logout") {
+    const file = credentialsPath(where);
+    if (existsSync(file)) rmSync(file);
+    print(`已删除本机保存的钥匙（${file}）。网页上的钥匙不受影响，要作废请到 ${KEYS_PAGE_URL} 撤销。`);
     return 0;
   }
 
@@ -1589,11 +1324,25 @@ export async function main(argv, io = {}) {
       print(JSON.stringify(a));
       return 0;
     }
-    print(`余额：${a.balance} 点（${a.wallet_type === "organization" ? "组织钱包" : "个人账户"}）`);
-    if (a.quota) {
-      print(`今天：已提交 ${a.quota.daily_generation_used} / ${a.quota.daily_generation_limit} 次，还能提交 ${a.quota.daily_generation_remaining} 次（${a.quota.resets_at} 重置）`);
-      print(`每分钟请求上限：${a.quota.requests_per_minute_limit} 次（每次工具调用算 2 次）`);
+    print(`余额：${a.balance} 点（${walletLabel(a)}）`);
+    if (a.quota && a.quota.daily_generation_remaining !== undefined && a.quota.daily_generation_remaining !== null) {
+      print(`今天还能提交 ${a.quota.daily_generation_remaining} 次（${a.quota.resets_at ?? "零点"} 重置）`);
     }
+    return 0;
+  }
+
+  if (command === "upload") {
+    const files = [sub, ...rest].filter(Boolean);
+    if (!files.length) throw new CliError("usage", "用法：quriov upload <图1> [图2 ...]", { exitCode: 2 });
+    const client = makeClient();
+    const results = [];
+    for (const file of files) {
+      const uploaded = await client.upload(resolve(file));
+      results.push({ file, url: uploaded.url, expires_in: uploaded.expiresIn });
+    }
+    if (args.json) print(JSON.stringify({ uploads: results }));
+    else for (const r of results) print(`${r.file}\t${r.url}`);
+    log(`链接 ${Math.round((results[0]?.expires_in ?? 86400) / 3600)} 小时内有效；在 MCP 里作为 {"type": "image_url", "value": "<链接>"} 放进 input_media。`);
     return 0;
   }
 
@@ -1659,7 +1408,7 @@ export async function main(argv, io = {}) {
     }
     const state = createState({ kind: "gen", batchId: newBatchId(now()), outDir, jobs, now: now() });
     saveState(state);
-    rememberBatch(state, { env });
+    rememberBatch(state, where);
     return execute(state, client, pre.templateAspect);
   }
 
@@ -1734,13 +1483,13 @@ export async function main(argv, io = {}) {
       });
       state.templateAspect = pre.templateAspect;
       saveState(state);
-      rememberBatch(state, { env });
+      rememberBatch(state, where);
       print(`批次号 ${state.batchId}（断了用 quriov batch resume ${state.batchId} 接着跑）`);
       return execute(state, client, pre.templateAspect);
     }
 
     if (sub === "status") {
-      const state = findState(rest[0] ?? ".", { env });
+      const state = findState(rest[0] ?? ".", where);
       if (args.json) {
         print(JSON.stringify({ batchId: state.batchId, counts: statusCounts(state), credits: sumCredits(state.jobs.map((j) => j.credits)), pausedUntil: state.pausedUntil, jobs: state.jobs.map(({ args: _a, ...job }) => job) }));
         return 0;
@@ -1757,7 +1506,7 @@ export async function main(argv, io = {}) {
     }
 
     if (sub === "resume") {
-      const state = findState(rest[0] ?? ".", { env });
+      const state = findState(rest[0] ?? ".", where);
       const retried = args.retryFailed ? retryFailedJobs(state) : 0;
       if (!isUnfinishedState(state)) {
         print(describeFinish(state, { paused: null, counts: statusCounts(state), costFile: join(state.outDir, state.costFile) }));
@@ -1776,7 +1525,7 @@ export async function main(argv, io = {}) {
         }
       }
       saveState(state);
-      rememberBatch(state, { env });
+      rememberBatch(state, where);
       print(`续跑批次 ${state.batchId}：已提交的会用原任务编号，服务端认得出，不会重复扣钱。`);
       return execute(state, client, state.templateAspect ?? {});
     }

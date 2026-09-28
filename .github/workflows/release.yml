@@ -1,0 +1,46 @@
+name: Release
+
+# 推一个 vX.Y.Z 标签 = 发一版：测试 → 打包 → 发布页挂两个安装包。
+#   quriov.tgz         固定文件名，install.md 用 releases/latest/download/quriov.tgz 永远拿到最新版
+#   quriov-X.Y.Z.tgz   带版本号，需要钉版本时用
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Tag must match package.json
+        run: |
+          expected="v$(node -p 'require("./package.json").version')"
+          test "$GITHUB_REF_NAME" = "$expected" || { echo "tag $GITHUB_REF_NAME does not match package.json ($expected)"; exit 1; }
+
+      - run: npm test
+
+      - name: Pack
+        run: |
+          tarball="$(npm pack --silent)"
+          cp "$tarball" quriov.tgz
+          echo "tarball=$tarball" >> "$GITHUB_ENV"
+
+      - name: Publish the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" quriov.tgz "$tarball" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" quriov.tgz "$tarball" --title "quriov $GITHUB_REF_NAME" --generate-notes --latest
+          fi

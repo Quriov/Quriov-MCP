@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -25,7 +25,7 @@ import {
 const TEST_KEY = "unit-test-cli-key-never-print";
 
 // ---------------------------------------------------------------------------
-// 假服务端：MCP JSON-RPC（8 个工具里命令行用到的那几个）+ 参考图上传 + 结果图下载。
+// 假服务端：MCP JSON-RPC（命令行用到的那几个工具 + tools/list）+ 参考图上传 + 结果图下载。
 // 不连任何真实地址，也不花钱。
 // ---------------------------------------------------------------------------
 
@@ -165,6 +165,12 @@ function createServer({ pollsUntilDone = 1, onTool = null, onHttp = null } = {})
       server.calls.push({ kind: "initialize" });
       return jsonResponse({ jsonrpc: "2.0", id: request.id, result: { protocolVersion: "2025-06-18", capabilities: {} } });
     }
+    if (request.method === "tools/list") {
+      server.calls.push({ kind: "tools/list" });
+      // 故意比核心工具多几个：自检只看核心工具在不在，不比总数。
+      const names = [...Object.keys(tools), "generate_video", "check_generation", "cancel_generation", "future_batch_tool"];
+      return jsonResponse({ jsonrpc: "2.0", id: request.id, result: { tools: names.map((name) => ({ name })) } });
+    }
     assert.equal(request.method, "tools/call");
     const { name, arguments: args } = request.params;
     server.calls.push({ kind: "tool", name, args });
@@ -206,7 +212,15 @@ function workspace() {
 }
 
 function env(dir, extra = {}) {
+  // 故意不带 PATH：不让测试探测到本机真装的客户端。
   return { QURIOV_MCP_ACCESS_KEY: TEST_KEY, XDG_CONFIG_HOME: join(dir, "config"), APPDATA: join(dir, "config"), ...extra };
+}
+
+// 每个测试一个假的用户目录：setup / uninstall 只准碰这里，绝不碰真的 ~/.claude.json 等。
+function fakeHome(dir) {
+  const home = join(dir, "home");
+  mkdirSync(home, { recursive: true });
+  return home;
 }
 
 async function run(argv, { dir, server, clock = fakeClock(), extraEnv = {}, shouldStop } = {}) {
@@ -220,6 +234,8 @@ async function run(argv, { dir, server, clock = fakeClock(), extraEnv = {}, shou
       stdout,
       stderr,
       stdin: { isTTY: false },
+      home: fakeHome(dir),
+      platform: "linux",
       fetchImpl: server ? server.fetch : async () => assert.fail("不应该联网"),
       sleep: clock.sleep,
       now: clock.now,
@@ -263,8 +279,9 @@ test("钥匙不能写在命令参数里", () => {
   assert.throws(() => parseArgv(["--bogus"]), (e) => e.code === "usage");
 });
 
-test("钥匙：正式名字优先，两个旧名字照认，最后才看 login 保存的文件", () => {
-  assert.deepEqual(KEY_ENV_NAMES, ["QURIOV_MCP_ACCESS_KEY", "QURIOV_MCP_KEY", "QURIOV_ACCESS_KEY"]);
+test("钥匙：正式名字 QURIOV_API_KEY 优先，三个旧名字照认，最后才看 setup 保存的文件", () => {
+  assert.deepEqual(KEY_ENV_NAMES, ["QURIOV_API_KEY", "QURIOV_MCP_ACCESS_KEY", "QURIOV_MCP_KEY", "QURIOV_ACCESS_KEY"]);
+  assert.equal(resolveKey({ env: { QURIOV_API_KEY: "new", QURIOV_MCP_ACCESS_KEY: "a" }, readFile: () => "" }).key, "new");
   const noFile = () => {
     throw new Error("no file");
   };
@@ -276,7 +293,7 @@ test("钥匙：正式名字优先，两个旧名字照认，最后才看 login �
   assert.equal(resolveKey({ env: {}, readFile: noFile, path: "/x" }), null);
   assert.throws(
     () => requireKey({ env: {}, readFile: noFile, path: "/x" }),
-    (e) => e.code === "missing_key" && e.message.includes("quriov login") && e.message.includes("QURIOV_MCP_ACCESS_KEY"),
+    (e) => e.code === "missing_key" && e.message.includes("quriov setup") && e.message.includes("QURIOV_API_KEY"),
   );
 });
 
@@ -284,10 +301,12 @@ test("--help 列出全部命令", async () => {
   const dir = workspace();
   const { code, stdout } = await run(["--help"], { dir });
   assert.equal(code, 0);
-  for (const word of ["quriov login", "quriov models", "quriov gen", "batch plan", "batch run", "batch status", "batch resume"]) {
+  for (const word of ["quriov setup", "quriov doctor", "quriov uninstall", "quriov upload", "quriov models", "quriov gen", "batch plan", "batch run", "batch status", "batch resume", "https://quriovai.com/install.md"]) {
     assert.ok(stdout.includes(word), word);
   }
   assert.equal(stdout.trim(), HELP.trim());
+  // 帮助里不写死服务端限额数字、工具总数
+  assert.doesNotMatch(HELP, /30 次|100 次|8 个工具/);
 });
 
 // ---------------------------------------------------------------------------
@@ -575,7 +594,7 @@ test("第一次就 401：说清是钥匙问题的三种可能，包括用途选�
   assert.ok(!error.message.includes(TEST_KEY));
 });
 
-test("用着用着 401：按每分钟限流处理，等一分钟自动重试", async () => {
+test("用着用着 401：按限流处理，等一分钟自动重试", async () => {
   const dir = workspace();
   let failOnce = true;
   const server = createServer({
@@ -591,7 +610,7 @@ test("用着用着 401：按每分钟限流处理，等一分钟自动重试", a
   const { code, error, stderr, clock } = await run(["account"], { dir, server });
   assert.equal(error, null, String(error?.message));
   assert.equal(code, 0);
-  assert.match(stderr, /每分钟请求数到上限/);
+  assert.match(stderr, /请求太密被限流/);
   assert.ok(clock.slept.includes(65_000));
 });
 
@@ -633,7 +652,6 @@ test("今天的提交次数用完：暂停、已提交的照常收尾、没提�
   assert.equal(error, null, String(error?.message));
   assert.equal(code, 4);
   assert.match(stdout, /今天的提交次数用完了/);
-  assert.match(stdout, /按提交次数算，不按张数/);
   assert.match(stdout, /quriov batch resume/);
   assert.ok(existsSync(join(out, "A001", "main_image.png")), "已提交的那张照常下载");
   const state = JSON.parse(readFileSync(join(out, ".quriov", stateFiles(join(out, ".quriov"))[0]), "utf8"));
@@ -699,43 +717,231 @@ test("参考图上传被拒（不是真图片）：说清按内容判断", async
   await assert.rejects(client.upload(join(dir, "refs", "a.png")), (e) => e.code === "unsupported_media_format" && /改扩展名没用/.test(e.message));
 });
 
-test("login：钥匙先验证再保存；没通过就不落盘", async () => {
-  const dir = workspace();
-  const piped = (text) => ({
+function piped(text) {
+  return {
     isTTY: false,
     async *[Symbol.asyncIterator]() {
       yield text;
     },
-  });
-  const server = createServer();
+  };
+}
+
+async function runSetup(argv, { dir, server, home, stdinText = `${TEST_KEY}\n`, extraEnv = {} }) {
   const stdout = sink();
-  const code = await main(["login"], {
-    env: { XDG_CONFIG_HOME: join(dir, "config") },
+  const stderr = sink();
+  const code = await main(argv, {
+    env: { XDG_CONFIG_HOME: join(dir, "config"), ...extraEnv },
     stdout,
-    stderr: sink(),
-    stdin: piped(`${TEST_KEY}\n`),
+    stderr,
+    stdin: piped(stdinText),
+    home,
+    platform: "linux",
     fetchImpl: server.fetch,
     sleep: async () => {},
   });
-  assert.equal(code, 0);
-  const saved = JSON.parse(readFileSync(join(dir, "config", "quriov", "credentials.json"), "utf8"));
-  assert.equal(saved.key, TEST_KEY);
-  assert.ok(!stdout.text.includes(TEST_KEY));
+  return { code, stdout: stdout.text, stderr: stderr.text };
+}
 
-  const dir2 = workspace();
+// ---------------------------------------------------------------------------
+// setup / doctor / uninstall（全部在假的用户目录里）
+// ---------------------------------------------------------------------------
+
+test("setup：钥匙先验证再保存；没通过就什么都不写", async () => {
+  const dir = workspace();
+  const home = fakeHome(dir);
+  mkdirSync(join(home, ".claude"));
   const bad = createServer({ onHttp: () => new Response("{}", { status: 401 }) });
+  await assert.rejects(runSetup(["setup", "--key-stdin"], { dir, server: bad, home }), (e) => e.code === "unauthorized");
+  assert.ok(!existsSync(join(dir, "config", "quriov", "credentials.json")));
+  assert.ok(!existsSync(join(home, ".claude.json")));
+  assert.ok(!existsSync(join(home, ".claude", "skills", "quriov")));
+});
+
+test("setup：钥匙格式不对（有空格、引号）直接拒绝，不联网", async () => {
+  const dir = workspace();
+  const server = createServer({ onHttp: () => assert.fail("不应该联网") });
   await assert.rejects(
-    main(["login"], {
-      env: { XDG_CONFIG_HOME: join(dir2, "config") },
-      stdout: sink(),
-      stderr: sink(),
-      stdin: piped(`${TEST_KEY}\n`),
-      fetchImpl: bad.fetch,
-      sleep: async () => {},
-    }),
-    (e) => e.code === "unauthorized",
+    runSetup(["setup", "--key-stdin"], { dir, server, home: fakeHome(dir), stdinText: 'abc" def-ghijklmnopqrst' }),
+    (e) => e.code === "invalid_key_format",
   );
-  assert.ok(!existsSync(join(dir2, "config", "quriov", "credentials.json")));
+});
+
+test("setup：三个客户端都写好、保留别的配置、装技能、自检全过；uninstall 全部清掉", async () => {
+  const dir = workspace();
+  const home = fakeHome(dir);
+  // Claude Code：已有别的 MCP 和一堆无关设置
+  writeFileSync(join(home, ".claude.json"), JSON.stringify({ numStartups: 3, mcpServers: { other: { type: "stdio", command: "x" } } }));
+  // Codex：已有别的设置、别的 MCP，还有旧版装的 quriov（环境变量写法 + 子表）
+  mkdirSync(join(home, ".codex"));
+  writeFileSync(
+    join(home, ".codex", "config.toml"),
+    [
+      'model = "gpt-5"',
+      "",
+      "[mcp_servers.other]",
+      'command = "npx"',
+      "",
+      "[mcp_servers.quriov]",
+      'url = "https://quriovai.com/mcp/v1"',
+      'bearer_token_env_var = "QURIOV_MCP_ACCESS_KEY"',
+      "",
+      "[mcp_servers.quriov.env_http_headers]",
+      'X = "Y"',
+      "",
+      '[projects."/tmp/x"]',
+      'trust_level = "trusted"',
+      "",
+    ].join("\n"),
+  );
+  // Cursor：目录在、配置文件还没有
+  mkdirSync(join(home, ".cursor"));
+  const server = createServer();
+
+  const { code, stdout } = await runSetup(["setup", "--key-stdin"], { dir, server, home });
+  assert.equal(code, 0, stdout);
+  assert.ok(!stdout.includes(TEST_KEY), "输出里不能有钥匙");
+  assert.match(stdout, /全部通过/);
+  assert.match(stdout, /\[通过\] MCP 连得上、核心工具齐全/);
+
+  const claude = JSON.parse(readFileSync(join(home, ".claude.json"), "utf8"));
+  assert.equal(claude.numStartups, 3);
+  assert.deepEqual(claude.mcpServers.other, { type: "stdio", command: "x" });
+  assert.deepEqual(claude.mcpServers.quriov, {
+    type: "http",
+    url: MCP_ENDPOINT,
+    headers: { Authorization: `Bearer ${TEST_KEY}` },
+  });
+
+  const codex = readFileSync(join(home, ".codex", "config.toml"), "utf8");
+  assert.match(codex, /^model = "gpt-5"$/m);
+  assert.match(codex, /\[mcp_servers\.other\]\ncommand = "npx"/);
+  assert.match(codex, /\[projects\."\/tmp\/x"\]\ntrust_level = "trusted"/);
+  assert.doesNotMatch(codex, /bearer_token_env_var|env_http_headers/, "旧版 quriov 整段（含子表）被替换");
+  assert.equal(codex.match(/\[mcp_servers\.quriov\]/g).length, 1);
+  assert.ok(codex.includes(`http_headers = { Authorization = "Bearer ${TEST_KEY}" }`));
+
+  const cursor = JSON.parse(readFileSync(join(home, ".cursor", "mcp.json"), "utf8"));
+  assert.deepEqual(cursor.mcpServers.quriov, { url: MCP_ENDPOINT, headers: { Authorization: `Bearer ${TEST_KEY}` } });
+
+  for (const skills of [join(home, ".claude", "skills"), join(home, ".agents", "skills")]) {
+    const text = readFileSync(join(skills, "quriov", "SKILL.md"), "utf8");
+    assert.match(text, /^---\r?\nname: quriov$/m);
+  }
+  if (process.platform !== "win32") {
+    for (const file of [join(home, ".claude.json"), join(home, ".codex", "config.toml"), join(dir, "config", "quriov", "credentials.json")]) {
+      assert.equal(statSync(file).mode & 0o777, 0o600, `${file} 里有钥匙，要仅本人可读写`);
+    }
+  }
+
+  // 再跑一次：幂等，不会写出第二份
+  await runSetup(["setup", "--key-stdin"], { dir, server, home });
+  assert.equal(readFileSync(join(home, ".codex", "config.toml"), "utf8").match(/\[mcp_servers\.quriov\]/g).length, 1);
+
+  // doctor：只读，四项全过
+  const doctor = await runSetup(["doctor"], { dir, server, home });
+  assert.equal(doctor.code, 0, doctor.stdout);
+  assert.equal(doctor.stdout.trim().split("\n").length, 4);
+  assert.ok(!doctor.stdout.includes(TEST_KEY));
+
+  // uninstall：只删 quriov 那一项、技能和保存的钥匙，别的原样
+  const un = await runSetup(["uninstall"], { dir, server, home });
+  assert.equal(un.code, 0);
+  const claudeAfter = JSON.parse(readFileSync(join(home, ".claude.json"), "utf8"));
+  assert.equal(claudeAfter.mcpServers.quriov, undefined);
+  assert.deepEqual(claudeAfter.mcpServers.other, { type: "stdio", command: "x" });
+  const codexAfter = readFileSync(join(home, ".codex", "config.toml"), "utf8");
+  assert.doesNotMatch(codexAfter, /quriov/);
+  assert.match(codexAfter, /\[mcp_servers\.other\]/);
+  assert.equal(JSON.parse(readFileSync(join(home, ".cursor", "mcp.json"), "utf8")).mcpServers.quriov, undefined);
+  assert.ok(!existsSync(join(home, ".claude", "skills", "quriov")));
+  assert.ok(!existsSync(join(home, ".agents", "skills", "quriov")));
+  assert.ok(!existsSync(join(dir, "config", "quriov", "credentials.json")));
+});
+
+test("setup：配置文件解析不了就跳过这个客户端、原样不动，自检报出来", async () => {
+  const dir = workspace();
+  const home = fakeHome(dir);
+  const broken = "{ this is not json";
+  writeFileSync(join(home, ".claude.json"), broken);
+  mkdirSync(join(home, ".codex"));
+  const inline = 'mcp_servers.quriov = { url = "x" }\n';
+  writeFileSync(join(home, ".codex", "config.toml"), inline);
+  const server = createServer();
+  const { code, stdout } = await runSetup(["setup", "--key-stdin"], { dir, server, home });
+  assert.equal(code, 1);
+  assert.equal(readFileSync(join(home, ".claude.json"), "utf8"), broken);
+  assert.equal(readFileSync(join(home, ".codex", "config.toml"), "utf8"), inline);
+  assert.match(stdout, /Claude Code：没改（文件不是合法的 JSON）/);
+  assert.match(stdout, /Codex：没改（quriov 是用行内写法定义的，不能安全替换）/);
+  assert.match(stdout, /\[没过\] 客户端配置正确/);
+});
+
+test("setup --dry-run：不联网、不写任何文件，只列出会改哪些", async () => {
+  const dir = workspace();
+  const home = fakeHome(dir);
+  mkdirSync(join(home, ".claude"));
+  const server = createServer({ onHttp: () => assert.fail("不应该联网") });
+  const { code, stdout } = await runSetup(["setup", "--dry-run"], { dir, server, home, stdinText: "" });
+  assert.equal(code, 0);
+  assert.match(stdout, /Claude Code：写入 MCP「quriov」/);
+  assert.match(stdout, /Codex：本机没发现，跳过/);
+  assert.ok(!existsSync(join(home, ".claude.json")));
+  assert.ok(!existsSync(join(home, ".claude", "skills", "quriov")));
+  assert.ok(!existsSync(join(dir, "config", "quriov", "credentials.json")));
+});
+
+test("setup：没输入新钥匙时沿用已保存的（升级重跑用）；--client 只配指定的客户端", async () => {
+  const dir = workspace();
+  const home = fakeHome(dir);
+  const server = createServer();
+  await runSetup(["setup", "--key-stdin", "--client", "cursor"], { dir, server, home });
+  assert.ok(existsSync(join(home, ".cursor", "mcp.json")), "指名的客户端没检测到也照配");
+  assert.ok(!existsSync(join(home, ".claude.json")));
+  const again = await runSetup(["setup", "--key-stdin", "--client", "cursor"], { dir, server, home, stdinText: "" });
+  assert.equal(again.code, 0, again.stdout);
+  assert.match(again.stdout, /沿用quriov setup 保存的钥匙/);
+  await assert.rejects(runSetup(["setup", "--client", "vscode"], { dir, server, home }), (e) => e.code === "usage");
+});
+
+test("setup：技能目录是软链到同一处时只装一份（比如 ~/.agents/skills → ~/.claude/skills）", { skip: process.platform === "win32" }, async () => {
+  const dir = workspace();
+  const home = fakeHome(dir);
+  mkdirSync(join(home, ".claude", "skills"), { recursive: true });
+  mkdirSync(join(home, ".codex"));
+  mkdirSync(join(home, ".agents"));
+  symlinkSync("../.claude/skills", join(home, ".agents", "skills"));
+  const server = createServer();
+  const { code, stdout } = await runSetup(["setup", "--key-stdin"], { dir, server, home });
+  assert.equal(code, 0, stdout);
+  assert.equal(stdout.match(/技能（/g).length, 1);
+  assert.match(stdout, /技能（Claude Code、Codex）/);
+});
+
+test("doctor：服务端少了核心工具才算没过；多了新工具照样通过", async () => {
+  const dir = workspace();
+  const home = fakeHome(dir);
+  const server = createServer({
+    onHttp: (url, init) => {
+      const body = typeof init.body === "string" ? JSON.parse(init.body) : null;
+      if (body?.method === "tools/list") {
+        return jsonResponse({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "get_account" }, { name: "list_capabilities" }] } });
+      }
+      return undefined;
+    },
+  });
+  const { code, stdout } = await runSetup(["doctor"], { dir, server, home, extraEnv: { QURIOV_API_KEY: TEST_KEY } });
+  assert.equal(code, 1);
+  assert.match(stdout, /缺少：estimate_cost、generate_image/);
+});
+
+test("upload：打印链接给 MCP 用，不打印钥匙", async () => {
+  const dir = workspace();
+  const server = createServer();
+  const { code, stdout, stderr } = await run(["upload", join(dir, "refs", "a.png")], { dir, server });
+  assert.equal(code, 0);
+  assert.match(stdout, /https:\/\/oss\.example\.test\/mcp-refs\/1\.png/);
+  assert.match(stderr, /input_media/);
+  assert.ok(!stdout.includes(TEST_KEY) && !stderr.includes(TEST_KEY));
 });
 
 test("非交互环境要花钱却没加 --yes：拒绝并说明", async () => {
