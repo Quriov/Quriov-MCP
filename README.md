@@ -24,7 +24,17 @@ quriov gen -m <模型> -p "白底主图" --ref a.jpg -n 4 -o ./out        # 单�
 quriov batch plan products.csv -m <模型> --estimate                 # 只估价，不花钱
 quriov batch run  products.csv -m <模型> -o ./out                   # 确认后提交、等结果、下载
 quriov batch resume ./out                                            # 断了接着跑
+
+quriov batch submit items.jsonl --dry-run                           # 整批交给服务端：先估价
+quriov batch submit items.jsonl --yes                               # 确认后提交（每次最多 50 条自动分组）
+quriov batch status <批次号> --wait --download ./out                  # 等全部结束，按 标记/模板 下载
+quriov jobs get <任务号>                                              # 按任务号查
+quriov jobs list --tag SKU123 --status failed --all                  # 翻历史（自动翻页）
+quriov jobs query <任务号...>                                          # 一次查多个
+quriov jobs cancel <任务号>                                           # 取消还在排队的（不扣费）
 ```
+
+以上命令加 `--json` 输出机器可读的结果（给 AI / 脚本用）；出错时 JSON 里有 `error_code`、中文 `reason`、`request_id`。
 
 `quriov --help` 有完整用法和退出码。
 
@@ -45,6 +55,32 @@ quriov batch resume ./out                                            # 断了接
 也可以用文件夹：每个子文件夹是一个商品，里面的图当参考图，可放 `prompt.txt`；图位用 `--templates a,b,c` 指定。
 
 结果在 `out/<货号>/<图位>.png`；`out/cost.csv` 每行的点数直接来自服务端返回（带 BOM，Excel 打开不乱码）。
+
+## 整批交给服务端（`batch submit`）
+
+和上面「一张表 + 本地参考图」的 `batch run` 不同，`batch submit` 把整批条目交给服务端，由服务端逐条提交；进度、结果、实扣都在服务端查。适合 AI 或脚本整理好条目后一次交。
+
+条目文件是 JSONL（一行一条）或 JSON 数组（也可以是 `{"batch_key": "...", "items": [...]}`），`-` 表示从标准输入读：
+
+```jsonl
+{"model": "<模型>", "prompt": "白底主图，正面平铺", "template_ids": ["main_image", "detail_1"], "reference_urls": ["https://…"], "aspect_ratio": "1:1", "n": 1, "tag": "SKU123"}
+{"model": "<模型>", "prompt": "蓝色水杯，木桌场景", "n": 2, "tag": "SKU124"}
+```
+
+| 字段 | 意思 |
+| --- | --- |
+| `model` / `prompt` | 必填 |
+| `template_ids` | 每个模板各出 `n` 张，最多 8 个；编号用 `quriov models` 查 |
+| `reference_urls` | 参考图 https 链接；本地图先 `quriov upload` |
+| `aspect_ratio` / `n` | 画幅 / 每个模板几张（1–4） |
+| `tag` | 你自己的标记（如货号）；下载时当文件夹名，`jobs list --tag` 可按它筛 |
+| `idempotency_key` | 一般不填：命令行按条目内容自动算，同一个文件重跑不会重复扣钱 |
+
+- 先估价、再确认（非交互要加 `--yes`）；余额不够整批时一条都不交。
+- 每次请求最多 50 条（`--chunk-size` 可调小），多的自动分组，全部归在同一个批次下（也可用 `--batch-key` 自己指定）。
+- 中途断了、超时了、充值后：原样重跑同一条命令，已交的原样返回、不扣钱，没交上的补交。
+- `batch status <批次号> --download ./out` 把结果存成 `out/<tag>/<模板>.png`（同一模板多张时加 `-1`、`-2`）；结果云端只留 1 天。
+- 只有服务端临时不可用（HTTP 503）会按它给的等待时间自动重试几次；其余错误不重试，报出中文原因、错误码和请求编号。
 
 ## 钥匙与安全
 

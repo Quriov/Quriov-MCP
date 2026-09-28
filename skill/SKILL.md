@@ -1,6 +1,6 @@
 ---
 name: quriov
-description: 用 Quriov 出图出视频：聊天里出一两张走 Quriov MCP 工具；批量（多个货号 × 多个图位）、本地参考图、要把图存进文件夹走命令行 quriov。用户要生成商品图、电商套图、带参考图出图、批量出图或生成视频时使用。
+description: 用 Quriov 出图出视频：聊天里出一两张走 Quriov MCP 工具；批量（多个货号 × 多个图位）、本地参考图、要把图存进文件夹、按任务号查结果 / 翻历史 / 取消走命令行 quriov。用户要生成商品图、电商套图、带参考图出图、批量出图、查出图结果或生成视频时使用。
 ---
 
 # Quriov 出图 / 出视频
@@ -9,9 +9,13 @@ MCP 工具（名为 `quriov` 的 MCP 服务）和命令行 `quriov` 用**同一�
 
 | 场景 | 用什么 |
 |---|---|
-| 批量（多个货号 × 多个图位）、要把图下载到本地文件夹、要一张费用清单 | 命令行 `quriov batch` |
-| 本地参考图（尤其是真实照片） | 命令行 `quriov gen --ref` / `quriov batch`（自动上传）；或先 `quriov upload` 换成链接再给 MCP |
+| 批量，条目由你（AI）整理好：参考图已是 https 链接或没有参考图，每条可带多个模板 | 命令行 `quriov batch submit`（整批交给服务端）+ `quriov batch status --wait --download` |
+| 批量，手上是一张表 + 本地参考图，要一张费用清单 | 命令行 `quriov batch plan / run`（本机按表跑，自动上传参考图） |
+| 本地参考图（尤其是真实照片） | 命令行 `quriov gen --ref` / `quriov batch run`（自动上传）；或先 `quriov upload` 换成链接 |
+| 按任务号查结果、翻历史、取消排队中的任务 | 命令行 `quriov jobs get / list / query / cancel` |
 | 聊天里出一两张、边看边改；出视频 | MCP 工具 |
+
+给 AI 用时一律加 `--json`（输出和报错都是 JSON，报错带 `error_code`、中文 `reason`、`request_id`）。
 
 ⛔ 不要为批量出图自己写循环脚本去调 MCP 或别的接口 —— 控速、断点续跑、不重复扣钱、下载和费用清单命令行都做了。
 
@@ -53,6 +57,29 @@ CSV 一行一个货号，列为 `sku,refs,templates,prompt,model,aspect_ratio,n`
 quriov gen -m <模型> -p "白底主图，正面平铺" --ref a.jpg --ref b.jpg -n 4 -o ./out
 ```
 
+## 整批交给服务端（batch submit）
+
+条目写成 JSONL（一行一条）或 JSON 数组。每条 = 一个商品的一组图：`template_ids` 里每个模板各出 `n` 张；不给模板就按提示词出 `n` 张。
+
+```jsonl
+{"model": "<模型>", "prompt": "白底主图，正面平铺，保留 logo", "template_ids": ["main_image", "detail_1"], "reference_urls": ["https://…"], "aspect_ratio": "1:1", "n": 1, "tag": "SKU123"}
+{"model": "<模型>", "prompt": "蓝色水杯，木桌场景", "n": 2, "tag": "SKU124"}
+```
+
+字段：`model`、`prompt` 必填；`template_ids`（最多 8 个）、`reference_urls`（https 链接，本地图先 `quriov upload`）、`aspect_ratio`、`n`（1–4）、`tag`（你自己的标记，如货号；下载时当文件夹名）、`idempotency_key`（一般不用填）。
+
+固定流程：
+
+1. `quriov batch submit items.jsonl --dry-run --json`：每条估价、要新交几条、合计点数、余额、哪些会被拒（免费，不提交）。
+2. 把估价原样告诉用户，取得明确确认。
+3. `quriov batch submit items.jsonl --yes --json`：打印批次号（`batch_ids`）和每条的 `job_id` / 状态 / 被拒原因。条目多时自动每次最多 50 条分组交，全部归在同一个批次下。
+4. `quriov batch status <批次号> --wait --download ./out --json`：等到全部结束，结果图存成 `out/<tag>/<模板>.png`（结果云端只留 1 天，尽快下载）。
+5. 汇报：成功 / 部分成功 / 失败的条目（附中文原因），`settled_credits` 实扣合计（只扣真正出来的图）。
+
+**不会重复扣钱**：没填 `idempotency_key` 时按条目内容自动算，同一个文件原样重跑，服务端认出来直接返回原任务。所以中途断了、超时了、余额不足充值后，**原样重跑同一条命令**即可接着交完。真想把同一份内容再出一遍，就改内容或给一个新的 `idempotency_key`（会再花钱，先估价再确认）。
+
+单个任务：`quriov jobs get <job_id>`；一串：`quriov jobs query <id...>`；历史：`quriov jobs list --tag SKU123 --status failed --all`；取消排队中的：`quriov jobs cancel <job_id>`（已在生成的不能取消）。
+
 ## 聊天里出图 / 出视频（MCP）
 
 1. 调 `list_capabilities`，从返回的模型和模板里选（以实时结果为准，别凭记忆写模型名）。
@@ -88,6 +115,7 @@ quriov upload ./ref-front.jpg ./ref-side.jpg
 
 ## 出错时
 
-- 把报错里的中文原因原样告诉用户；有请求编号（request_id）就一起报出来，方便管理员查。
+- 把报错里的中文原因原样告诉用户，连同错误码（error_code）和请求编号（request_id），方便管理员查。
 - 连不上、钥匙不对、MCP 工具不见了：运行 `quriov doctor`，按它的提示处理（多数是重跑 `quriov setup`）。
-- 余额不足：请用户充值后再 `resume`。
+- 余额不足：请用户充值后再 `resume`（`batch submit` 则是原样重跑同一条命令）。
+- `503` 命令行会按服务端给的等待时间自动重试几次；其余错误不自动重试，按原因处理后再跑。
