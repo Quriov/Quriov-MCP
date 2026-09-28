@@ -1,118 +1,55 @@
-# Quriov MCP
+# Quriov 命令行 `quriov`
 
-Official installation and validation recipes for Quriov MCP.
+Quriov（https://quriovai.com）出图出视频的官方命令行。一条 `quriov setup` 把三样东西一起装好，全部用同一把钥匙：
 
-Quriov MCP lets a trusted coding agent inspect the available image and video
-generation capabilities, estimate a job, generate media after confirmation,
-and check or cancel the resulting task. The hosted service is operated at:
+- **MCP**：给本机的 Claude Code / Codex / Cursor 写好名为 `quriov` 的 MCP，聊天里就能出图出视频；
+- **技能**：教 AI 什么时候用 MCP、什么时候用命令行、花钱前先估价；
+- **命令行**：批量出图（一张表，每行一个商品）、本地参考图自动上传、结果下载到文件夹、每张花多少点写进 `cost.csv`、断了接着跑不重复扣钱。
 
-```text
-https://quriovai.com/mcp/v1
-```
+## 安装
 
-This repository is the public distribution layer for client setup,
-read-only validation, and the official `quriov` command-line tool. It is not
-the MCP server source, a plugin, or a general installer.
+**见 https://quriovai.com/install.md**（唯一的安装说明）。最省事的做法：在网页 https://quriovai.com/me/access-keys 建一把钥匙，点「复制给 AI 安装」，粘给你的 AI。
 
-## 命令行 quriov（批量出图）
-
-和 MCP 同一把钥匙、同一个后端。聊天里出一两张用 MCP；批量、用本地参考图、要把图存进文件夹，用命令行。完整中文说明见 [`CLI.md`](CLI.md)。
+## 常用命令
 
 ```text
-# 需要 Node 20+，Mac / Windows 都行；npm 10 / 11 / 12 都不用加参数（Windows PowerShell 5 用 curl.exe）
-curl -fLO https://github.com/Quriov/Quriov-MCP/releases/download/v1.1.1/quriov-mcp-distribution-1.1.1.tgz
-npm install -g ./quriov-mcp-distribution-1.1.1.tgz
-quriov login                                      # 粘贴网页上建的「MCP」钥匙（不回显）
+quriov setup              # 装好 / 修好：验钥匙、写 MCP、装技能、自检（--dry-run 只看不写）
+quriov doctor             # 只读自检：钥匙、MCP、客户端配置、技能
+quriov uninstall          # 删掉 quriov 写过的配置、技能和本机保存的钥匙
+quriov account            # 余额
+quriov models             # 能用的模型、模板编号、每张多少点
+quriov upload a.jpg       # 上传本地参考图，打印给 MCP 用的链接
 
-# 20 个商品 × 每个 9 个图位：一张表，每行一个商品
-quriov batch plan products.csv -m gpt-image-2.5-2K --estimate   # 只估价，不花钱
-quriov batch run  products.csv -m gpt-image-2.5-2K -o ./out     # 确认后提交、等结果、下载
-quriov batch resume ./out                                       # 断了接着跑，不重复扣钱
+quriov gen -m <模型> -p "白底主图" --ref a.jpg -n 4 -o ./out        # 单张 / 小批
+quriov batch plan products.csv -m <模型> --estimate                 # 只估价，不花钱
+quriov batch run  products.csv -m <模型> -o ./out                   # 确认后提交、等结果、下载
+quriov batch resume ./out                                            # 断了接着跑
 ```
 
-结果在 `out/<货号>/<图位>.png`，每个任务花了多少点在 `out/cost.csv`（数字来自服务端返回）。
+`quriov --help` 有完整用法和退出码。
 
-## Before you install
+## 批量表格
 
-- Create a dedicated `scope=mcp` access key at
-  [quriovai.com/me/access-keys](https://quriovai.com/me/access-keys).
-- Use a separate key for each client or device so it can be revoked without
-  disrupting other clients.
-- If you paste a key into Codex, Claude Code, Cursor, or another agent, that
-  agent's provider, model, and chat history can see it. Only use a personal,
-  trusted session. Never send the key to a public or shared task.
-- A Quriov MCP key can be revoked from the website at any time. Revocation and
-  client uninstall are separate actions.
+第一行是表头，每行一个商品（Excel 另存为「CSV UTF-8」即可）；例子见 [`examples/products.csv`](examples/products.csv)。
 
-## Verified client capability matrix
+| 列 | 意思 |
+| --- | --- |
+| `sku` 货号 | 必填，也是输出子文件夹的名字 |
+| `refs` 参考图 | 分号隔开，路径相对这张表所在的文件夹 |
+| `templates` 模板 | 分号隔开；**每个模板 = 一个图位 = 一次提交**，编号用 `quriov models` 查 |
+| `prompt` 提示词 | 必填，商品描述（模板会接在它前面） |
+| `model` 模型 | 可不填，改用命令里的 `-m` |
+| `aspect_ratio` 比例 | 如 `1:1`、`3:4`；不填用模板自己的比例 |
+| `n` 张数 | 每个图位几张（1–4，默认 1） |
 
-Checked against official documentation and local client spikes on 2026-07-14.
-Unverified items are intentionally not described as automatic installation.
+也可以用文件夹：每个子文件夹是一个商品，里面的图当参考图，可放 `prompt.txt`；图位用 `--templates a,b,c` 指定。
 
-| Client | Official capability | Local spike | Product wording |
-| --- | --- | --- | --- |
-| Codex Desktop / CLI / IDE | The clients share `~/.codex/config.toml`; Streamable HTTP supports bearer auth, static `http_headers`, and environment-backed headers. Desktop and IDE require a restart after configuration. | `@openai/codex` `0.144.3`: isolated add/get/list/remove passed. Windows Codex App package `26.707.8479.0` was detected, but its bundled CLI could not be launched from the shell because of WindowsApps ACLs. | Trusted-agent installation is supported. App-shell command execution remains `unverified`; restart the app or extension. |
-| Claude Code | Remote HTTP, static headers, `user` scope, list/get/remove, and `/mcp` status are documented. | Claude Code `2.1.207`: user-scope add/get/remove passed with a disposable invalid credential and left no spike entry behind. | Trusted-agent installation is supported. |
-| Cursor | Global `~/.cursor/mcp.json`, header interpolation, Streamable HTTP, MCP approval, CLI list, and CLI list-tools are documented. | No Cursor or Cursor Agent executable was installed on the verification machine. | AI-assisted configuration only; automatic installation is `unverified`. |
+结果在 `out/<货号>/<图位>.png`；`out/cost.csv` 每行的点数直接来自服务端返回（带 BOM，Excel 打开不乱码）。
 
-Primary sources:
+## 钥匙与安全
 
-- [OpenAI Codex MCP documentation](https://developers.openai.com/codex/mcp/)
-- [Claude Code MCP documentation](https://code.claude.com/docs/en/mcp)
-- [Cursor MCP documentation](https://cursor.com/docs/mcp)
-- [Cursor CLI parameters](https://docs.cursor.com/en/cli/reference/parameters)
+- 钥匙只从隐藏输入、标准输入（`--key-stdin`）或环境变量 `QURIOV_API_KEY` 读，**永远不从命令参数读**；不打印、不写进日志和批次存档。
+- `setup` 把钥匙存进本机用户目录（仅本人可读写），并写进三个客户端的用户级 MCP 配置（图形版客户端读不到 shell 里的环境变量）。卸载不会作废钥匙，作废请到网页撤销。
+- 零依赖，只用 Node 20+ 自带的功能；只连 `https://quriovai.com` 和它返回的结果图链接。
 
-## Public contract
-
-- One remote endpoint: `https://quriovai.com/mcp/v1`.
-- Authentication: a revocable Quriov `scope=mcp` access key.
-- Exactly eight tools:
-  `cancel_generation`, `check_generation`, `estimate_cost`, `generate_image`,
-  `generate_video`, `get_account`, `list_capabilities`, and
-  `list_generations`.
-- Client recipes may write only the named client's user-scope MCP
-  configuration and credential reference.
-- The doctor is read-only. It initializes the server, checks the exact tool
-  contract, and calls `get_account` without printing account data.
-- The CLI uses the same key and the same eight tools, plus
-  `https://quriovai.com/api/v1/mcp/uploads` for local reference images. It
-  downloads results from the presigned URLs the tools return, without sending
-  the key.
-
-## Repository map
-
-- [`AGENTS.md`](AGENTS.md): safety and contribution contract for agents.
-- [`llms.txt`](llms.txt): compact machine-readable index.
-- [`recipes/codex.md`](recipes/codex.md): pinned Codex install, verify, and
-  uninstall recipe.
-- [`recipes/claude-code.md`](recipes/claude-code.md): pinned Claude Code
-  install, verify, and uninstall recipe.
-- [`recipes/cursor.md`](recipes/cursor.md): Cursor AI-assisted configuration;
-  automatic installation remains `unverified`.
-- [`install-manifest.json`](install-manifest.json): release contract and
-  SHA-256 locks for every install input.
-- [`contract.lock.json`](contract.lock.json): non-authoritative public snapshot
-  of the fixed endpoint and exact eight-tool contract.
-- [`bin/quriov-mcp-doctor.mjs`](bin/quriov-mcp-doctor.mjs): read-only protocol
-  doctor, covered by Node tests.
-- [`bin/quriov.mjs`](bin/quriov.mjs): official zero-dependency CLI, covered by
-  Node tests with a mocked HTTP layer. Chinese guide: [`CLI.md`](CLI.md);
-  example batch spec: [`examples/products.csv`](examples/products.csv).
-- [`SECURITY.md`](SECURITY.md): private reporting path and threat model.
-
-After checking out the commit or tag supplied by the Quriov website and
-verifying the supplied manifest hash, run the doctor without putting the key
-in a command-line argument:
-
-```text
-node bin/quriov-mcp-doctor.mjs --key-stdin
-```
-
-The doctor reports only stage status, the exact tool count, and a redacted
-`get_account` result. It does not install, modify configuration, generate,
-spend credit, or revoke a key.
-
-## License
-
-The public installation and validation material in this repository is released
-under the [MIT License](LICENSE).
+漏洞报告见 [SECURITY.md](SECURITY.md)。许可：[MIT](LICENSE)。

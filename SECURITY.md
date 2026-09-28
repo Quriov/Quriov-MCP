@@ -1,39 +1,7 @@
-# Security policy
+# 安全
 
-## Reporting a vulnerability
+发现漏洞请走私下渠道：[GitHub Security Advisory](https://github.com/Quriov/Quriov-MCP/security/advisories/new)。不要开公开 issue，也不要在报告里贴钥匙、账户数据或你的客户端配置。
 
-Please use the private
-[GitHub Security Advisory form](https://github.com/Quriov/Quriov-MCP/security/advisories/new)
-for suspected vulnerabilities. Do not open a public issue for a security
-report, and never include an access key, credential, account response, or
-private configuration in a report.
+钥匙可能泄露了：马上到 https://quriovai.com/me/access-keys 撤销它，再建一把新的，重跑 `quriov setup`。`quriov uninstall` 只删本机配置，**不会**作废钥匙。
 
-If a credential may have been exposed, revoke that dedicated key immediately
-from the Quriov website, then create a replacement for the affected client.
-Removing a client configuration does not revoke its key.
-
-## Distribution threat model
-
-This repository deliberately contains no MCP server implementation or
-privileged operational material. Its install contract limits agents to one
-fixed HTTPS endpoint and the selected client's user-scope configuration.
-Install prompts must pin a reviewed release or commit and the SHA-256 of
-`install-manifest.json`; mutable branch content is not an installation source.
-
-The doctor is read-only. It may initialize the fixed endpoint, list the exact
-eight public tools, and call `get_account`, but it must not print account data,
-write configuration, generate media, spend credit, or revoke credentials.
-
-The CLI (`bin/quriov.mjs`) spends credit only on the user's explicit command
-after a server-side estimate and confirmation. It talks to the fixed MCP
-endpoint plus the reference-image upload endpoint, downloads results from the
-presigned `https` URLs those responses contain without sending the key, and
-keeps its batch state and cost list in the user's own output folder. It never
-accepts a key or endpoint as a command-line argument.
-
-## Public information boundary
-
-Reports and fixes must not publish provider routing, internal prompts,
-infrastructure details, prices, profit data, raw upstream responses, or private
-Registry metadata. The public contract in `contract.lock.json` is a
-non-authoritative compatibility snapshot only.
+命令行的安全边界见 [AGENTS.md](AGENTS.md)。

@@ -1,4 +1,4 @@
-name: Distribution CI
+name: CI
 
 on:
   pull_request:
@@ -11,153 +11,113 @@ permissions:
   contents: read
 
 concurrency:
-  group: distribution-ci-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  verify:
-    name: Node ${{ matrix.node }}
-    runs-on: ubuntu-latest
+  test:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
         node:
           - "20"
           - "22"
 
     steps:
-      - name: Check out the reviewed tree
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
 
-      - name: Run doctor tests
+      - name: Unit tests
         run: npm test
 
-      - name: Validate executable syntax and package contents
-        run: |
-          node --check bin/quriov-mcp-doctor.mjs
-          node --check bin/quriov.mjs
-          node bin/quriov.mjs --help > /dev/null
-          npm pack --dry-run
-
-      - name: Install from the packed tarball (the documented install path)
+      - name: Install from the packed tarball, then setup --dry-run in a throwaway home
         shell: bash
         run: |
-          # The release ships this exact `npm pack` tarball; npm 12 refuses git installs by default
-          # (allow-git=none), so the tarball is what users install. Prove it installs and runs.
+          set -euo pipefail
           tarball="$(npm pack --silent)"
           prefix="$(mktemp -d)"
           npm install -g --prefix "$prefix" "./$tarball"
-          version="$("$prefix/bin/quriov" --version)"
+          if [ "$RUNNER_OS" = "Windows" ]; then bin="$prefix"; else bin="$prefix/bin"; fi
+          version="$("$bin/quriov" --version)"
           expected="$(node -p 'require("./package.json").version')"
           test "$version" = "$expected" || { echo "installed quriov reports $version, expected $expected"; exit 1; }
-          test -x "$prefix/bin/quriov-mcp-doctor"
+          if [ "$RUNNER_OS" = "Windows" ]; then pkg="$prefix/node_modules/quriov"; else pkg="$prefix/lib/node_modules/quriov"; fi
+          test -f "$pkg/skill/SKILL.md" || { echo "skill/SKILL.md missing from the package"; exit 1; }
+          fake_home="$(mktemp -d)"
+          mkdir -p "$fake_home/.claude" "$fake_home/.codex"
+          out="$(HOME="$fake_home" USERPROFILE="$fake_home" "$bin/quriov" setup --dry-run < /dev/null)"
+          echo "$out"
+          echo "$out" | grep -q "Claude Code：写入 MCP「quriov」"
+          echo "$out" | grep -q "Codex：写入 MCP「quriov」"
+          test ! -e "$fake_home/.claude.json" || { echo "--dry-run wrote a file"; exit 1; }
+          if [ "$RUNNER_OS" = "Windows" ]; then echo "prefix=$(cygpath -w "$prefix")" >> "$GITHUB_ENV"; fi
           rm -f "$tarball"
-          echo "tarball $tarball installs and reports $version"
 
-      - name: Fail closed on contract drift or secret-like content
-        shell: bash
+      - name: PowerShell path (quriov.cmd, key piped on stdin)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $fake = Join-Path $env:RUNNER_TEMP "fake-home"
+          New-Item -ItemType Directory -Force -Path (Join-Path $fake ".cursor") | Out-Null
+          $env:USERPROFILE = $fake
+          $env:HOME = $fake
+          & "$env:prefix\quriov.cmd" --version
+          $out = 'ci-placeholder-key-not-real-0000' | & "$env:prefix\quriov.cmd" setup --dry-run --key-stdin
+          $out
+          if (-not ($out -match "Cursor")) { throw "setup --dry-run did not list Cursor" }
+          if (Test-Path (Join-Path $fake ".cursor\mcp.json")) { throw "--dry-run wrote a file" }
+
+  checks:
+    name: Secrets and hard-coded facts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - name: Fail on secret-like content, stray URLs, and facts that go stale
         run: |
           node --input-type=module <<'NODE'
-          import { createHash } from "node:crypto";
           import { execFileSync } from "node:child_process";
           import { readFile } from "node:fs/promises";
 
-          const endpoint = "https://quriovai.com/mcp/v1";
-          const uploadEndpoint = "https://quriovai.com/api/v1/mcp/uploads";
-          const tools = [
-            "cancel_generation",
-            "check_generation",
-            "estimate_cost",
-            "generate_image",
-            "generate_video",
-            "get_account",
-            "list_capabilities",
-            "list_generations",
-          ];
-          const manifest = JSON.parse(await readFile("install-manifest.json", "utf8"));
-          const contract = JSON.parse(await readFile("contract.lock.json", "utf8"));
-
-          if (manifest.endpoint !== endpoint || manifest.scope !== "mcp") {
-            throw new Error("installation endpoint or scope drifted");
-          }
-          if (
-            JSON.stringify(manifest.allowedNetworkTargets) !==
-            JSON.stringify([endpoint, uploadEndpoint])
-          ) {
-            throw new Error("installation network allowlist drifted");
-          }
-          const cliSource = await readFile("bin/quriov.mjs", "utf8");
-          const cliTargets = [...cliSource.matchAll(/https:\/\/quriovai\.com[^\s"'`)]*/g)].map((m) => m[0]);
-          for (const target of cliTargets) {
-            // The CLI builds every Quriov URL from one ORIGIN constant; any other literal is drift.
-            if (target !== "https://quriovai.com") {
-              throw new Error(`CLI references an unlisted Quriov URL: ${target}`);
-            }
-          }
-          if (contract.endpoint !== endpoint || contract.scope !== "mcp") {
-            throw new Error("public contract endpoint or scope drifted");
-          }
-          if (JSON.stringify(contract.tools) !== JSON.stringify(tools)) {
-            throw new Error("public tool contract must remain exactly eight tools");
-          }
-          if (contract.authoritative !== false || contract.publicFieldsOnly !== true) {
-            throw new Error("public contract boundary drifted");
-          }
-
-          for (const [path, expected] of Object.entries(manifest.files)) {
-            const actual = createHash("sha256")
-              .update(await readFile(path))
-              .digest("hex");
-            if (actual !== expected) {
-              throw new Error(`${path} hash drifted: update only in a reviewed release`);
-            }
-          }
-
-          const tracked = execFileSync("git", ["ls-files"], { encoding: "utf8" })
-            .trim()
-            .split(/\r?\n/)
-            .filter(Boolean);
-          const forbiddenPaths = [
-            /(^|\/)\.env($|\.)/i,
-            /(^|\/)(deployment|infrastructure|ops|providers?|server)(\/|$)/i,
-          ];
-          for (const path of tracked) {
-            if (forbiddenPaths.some((pattern) => pattern.test(path))) {
-              throw new Error(`forbidden distribution path: ${path}`);
-            }
-          }
-
+          const tracked = execFileSync("git", ["ls-files"], { encoding: "utf8" }).trim().split(/\r?\n/).filter(Boolean);
           const secretPatterns = [
             /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
             /\bsk-[A-Za-z0-9_-]{16,}\b/,
+            /\bqry_live_[A-Za-z0-9_-]{16,}\b/,
             /\bqv_[A-Za-z0-9_-]{16,}\b/i,
-            /\bBearer\s+[A-Za-z0-9._-]{16,}\b/i,
           ];
+          const problems = [];
           for (const path of tracked) {
             const text = await readFile(path, "utf8").catch(() => "");
-            if (secretPatterns.some((pattern) => pattern.test(text))) {
-              throw new Error(`secret-like content detected in ${path}`);
+            if (secretPatterns.some((p) => p.test(text))) problems.push(`secret-like content in ${path}`);
+            if (/^(bin|lib)\//.test(path)) {
+              // Every Quriov URL is built from the single ORIGIN constant in lib/common.mjs.
+              for (const m of text.matchAll(/https:\/\/quriovai\.com[^\s"'`)]*/g)) {
+                if (m[0] !== "https://quriovai.com") problems.push(`${path} hard-codes ${m[0]} (build it from ORIGIN)`);
+              }
             }
-            if (/raw\.githubusercontent\.com\/[^\s]+\/main\//i.test(text)) {
-              throw new Error(`mutable raw GitHub reference detected in ${path}`);
-            }
-          }
-
-          for (const recipe of [
-            "recipes/codex.md",
-            "recipes/claude-code.md",
-            "recipes/cursor.md",
-          ]) {
-            const text = await readFile(recipe, "utf8");
-            if (!text.includes("RELEASE_COMMIT") || !text.includes("MANIFEST_SHA256")) {
-              throw new Error(`${recipe} does not require immutable prompt pins`);
+            if (["README.md", "AGENTS.md", "SECURITY.md", "skill/SKILL.md"].includes(path)) {
+              // These go stale: the version lives only in package.json, the tool list and limits only on the server.
+              if (/\bv?\d+\.\d+\.\d+\b/.test(text)) problems.push(`${path} mentions a version number`);
+              if (/exactly (eight|8)|恰好 ?8|8 个工具|8 项|每分钟 ?\d+ ?次|每天 ?\d+ ?次/.test(text)) {
+                problems.push(`${path} hard-codes a tool count or a server limit`);
+              }
             }
           }
-
-          console.log(`validated ${tracked.length} tracked files and ${tools.length} tools`);
+          if (problems.length) {
+            console.error(problems.join("\n"));
+            process.exit(1);
+          }
+          console.log(`checked ${tracked.length} tracked files`);
           NODE

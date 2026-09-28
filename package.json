@@ -1,18 +1,27 @@
 {
-  "name": "quriov-mcp-distribution",
-  "version": "1.1.1",
-  "private": true,
-  "description": "Pinned recipes, a read-only doctor, and the official quriov CLI for Quriov MCP",
+  "name": "quriov",
+  "version": "1.2.0",
+  "description": "Quriov 官方命令行：一条 quriov setup 装好 MCP 和技能，批量出图",
   "type": "module",
   "bin": {
-    "quriov": "./bin/quriov.mjs",
-    "quriov-mcp-doctor": "./bin/quriov-mcp-doctor.mjs"
+    "quriov": "./bin/quriov.mjs"
   },
+  "files": [
+    "bin",
+    "lib",
+    "skill",
+    "README.md"
+  ],
   "scripts": {
     "test": "node --test"
   },
   "engines": {
     "node": ">=20"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Quriov/Quriov-MCP.git"
+  },
+  "homepage": "https://quriovai.com/install.md",
   "license": "MIT"
 }
