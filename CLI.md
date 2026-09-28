@@ -14,18 +14,26 @@
 
 需要 Node.js 20 或更新版本。
 
+先把发布页上的安装包下载到当前文件夹，再从这个文件安装（两步，npm 10 / 11 / 12 都不用加任何参数）：
+
 ```text
-npm install -g https://github.com/Quriov/Quriov-MCP/releases/download/v1.1.1/quriov-mcp-distribution-1.1.1.tgz
-quriov --help
+curl -fLO https://github.com/Quriov/Quriov-MCP/releases/download/v1.1.1/quriov-mcp-distribution-1.1.1.tgz
+npm install -g ./quriov-mcp-distribution-1.1.1.tgz
+quriov --version     # 应显示 1.1.1
 ```
 
-装的是 GitHub 发布页上附带的安装包（`npm pack` 打出来的 `.tgz`），npm 10 / 11 / 12 都能直接装，不用加任何参数。装完 `quriov --version` 应显示 `1.1.1`。
+- Windows 自带的 PowerShell 5 里 `curl` 是别的命令，把第一行的 `curl` 换成 `curl.exe`；也可以直接在浏览器打开上面的地址下载，放到当前文件夹再运行第二行。
+- 为什么不一步 `npm install -g <地址>`：**npm 12 默认不许直接从网址装**，会报 `EALLOWREMOTE`（npm 10 / 11 可以）。用 npm 12 又想一步装，要加 `--allow-remote=all`：
 
-> 旧写法 `npm install -g github:Quriov/Quriov-MCP#v1.1.1`（直接从 git 装）也能用，但 **npm 12 默认不许从 git 装**，会报 `EALLOWGIT`；用 npm 12 又想走这条路，要加 `--allow-git=all`：
->
-> ```text
-> npm install -g --allow-git=all github:Quriov/Quriov-MCP#v1.1.1
-> ```
+  ```text
+  npm install -g --allow-remote=all https://github.com/Quriov/Quriov-MCP/releases/download/v1.1.1/quriov-mcp-distribution-1.1.1.tgz
+  ```
+
+- 旧写法 `npm install -g github:Quriov/Quriov-MCP#v1.1.1`（直接从 git 装）也还能用，但 **npm 12 默认不许从 git 装**，会报 `EALLOWGIT`；用 npm 12 走这条路要加 `--allow-git=all`：
+
+  ```text
+  npm install -g --allow-git=all github:Quriov/Quriov-MCP#v1.1.1
+  ```
 
 不想全局安装，也可以在本仓检出后直接运行 `node bin/quriov.mjs --help`。零依赖，不会装任何第三方包。
 
