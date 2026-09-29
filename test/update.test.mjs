@@ -47,7 +47,14 @@ function fakeGitHub({ latest = NEWER, assetUrl, releaseStatus = 200, downloadSta
   gh.fetch = async (url, init = {}) => {
     gh.calls.push({ url: String(url), headers: init.headers ?? {} });
     if (hang) {
-      return new Promise((_, fail) => init.signal?.addEventListener("abort", () => fail(new Error("aborted"))));
+      // 像真的网络请求一样占着事件循环（真 fetch 有 socket 挂着），直到被中止；中止不了测试就会卡死。
+      return new Promise((_, fail) => {
+        const socket = setInterval(() => {}, 1000);
+        init.signal?.addEventListener("abort", () => {
+          clearInterval(socket);
+          fail(new Error("aborted"));
+        });
+      });
     }
     if (offline) throw new TypeError("fetch failed");
     if (url === LATEST_RELEASE_API) {
