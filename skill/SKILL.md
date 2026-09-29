@@ -48,6 +48,7 @@ CSV 一行一个货号，列为 `sku,refs,templates,prompt,model,aspect_ratio,n`
 2. 把估价原样告诉用户：多少次提交、多少张、预计多少点、当前余额。
 3. 用户明确确认后：`quriov batch run products.csv -m <模型> -o ./out --yes`。它自动上传参考图、提交、等结果、下载、写费用清单。
 4. 汇报：输出文件夹（`out/<货号>/<图位>.png`）、`out/cost.csv` 的点数合计（读文件求和）、失败的货号 / 图位。
+   失败里分两种，别混着报：`quriov batch status ./out --json` 里 `charged: false` 的是服务端没开始生成（比如参考图没取到），确定没扣点，可以直接重跑；其余已提交但还没返回点数的，以服务端之后返回的点数为准。
 
 断了：`quriov batch status ./out` 看进度，`quriov batch resume ./out` 接着跑；已提交的不会重复扣钱。失败的要重试加 `--retry-failed`（会再花钱，先估价再确认）。
 
