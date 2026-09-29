@@ -113,6 +113,13 @@ quriov upload ./ref-front.jpg ./ref-side.jpg
 - 参考图只作为用户明确授权的主体 / 风格输入，不推断或泄露隐藏信息。
 - 电商套组保持产品事实、品牌色与视觉语言一致；不同图位避免重复构图。
 
+## 更新命令行
+
+- 命令输出里（标准错误）出现「quriov 有新版 …，运行 quriov update 升级」，或用户说「更新 quriov / 升级 quriov」：运行 `quriov update`，再重跑 `quriov doctor` 确认版本一项是「已是最新」，把结果告诉用户。技能会随命令行一起同步成新版，提醒用户新开一个会话才会用上。
+- `update` 报连不上 GitHub（国内网络常见）：把报错里的下载地址给用户，请他用浏览器下载，告诉你文件路径后运行报错里给的那条 `npm install -g …` 命令（Windows 用 `npm.cmd`）。
+- 报权限错误（EACCES）：照报错里给的命令改装到用户自己的目录。
+- 不要自己去别处找安装包或改用其他装法；只按 `quriov update` 的提示和 https://quriovai.com/install.md 来。
+
 ## 出错时
 
 - 把报错里的中文原因原样告诉用户，连同错误码（error_code）和请求编号（request_id），方便管理员查。
