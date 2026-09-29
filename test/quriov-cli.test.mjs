@@ -16,6 +16,8 @@ import {
   main,
   parseArgv,
   parseCsv,
+  createState,
+  renderCostCsv,
   requireKey,
   resolveKeys,
   resolveKey,
@@ -563,7 +565,7 @@ test("resume --retry-failed：失败的换新编号重交，成功的不动", as
   assert.equal(first.code, 3, "有失败返回 3");
   assert.match(first.stdout, /内容审核没通过/);
   const cost = readFileSync(join(out, "cost.csv"), "utf8");
-  assert.match(cost, /A001,scene,scene,gpt-image-2.5-2K,1,0,,,失败/);
+  assert.match(cost, /A001,scene,scene,gpt-image-2.5-2K,1,0,,没扣点,失败/);
 
   rejectScene = false;
   const before = server.toolCalls("generate_image").length;
@@ -572,6 +574,89 @@ test("resume --retry-failed：失败的换新编号重交，成功的不动", as
   const retried = server.toolCalls("generate_image").slice(before);
   assert.equal(retried.length, 2, "只重交失败的两个");
   assert.ok(retried.every((c) => c.args.idempotency_key.endsWith("-a2")));
+});
+
+// ---------------------------------------------------------------------------
+// 花费清单合计行：没生成、没扣点的失败 vs 已提交还没结算，分开说
+// ---------------------------------------------------------------------------
+
+function costTotalLine(state) {
+  const lines = renderCostCsv(state).trim().split("\r\n");
+  return lines[lines.length - 1];
+}
+
+function oneJobState(fields) {
+  const state = createState({
+    kind: "batch",
+    batchId: "20260929-1200-abcd",
+    outDir: join(tmpdir(), "quriov-cost-note"),
+    jobs: [{ sku: "A001", slot: "main_image", templateId: "main_image", model: "gpt-image-2.5-2K", n: 1, refs: [], prompt: "杯子" }],
+  });
+  Object.assign(state.jobs[0], fields);
+  return state;
+}
+
+test("合计行：取参考图失败（media_fetch_failed、没有生成编号）= 没生成、没扣点，可以直接重跑", () => {
+  const state = oneJobState({ status: "failed", requestId: "req-1", generationId: null, charged: false, errorCode: "media_fetch_failed", errorMessage: "x" });
+  const total = costTotalLine(state);
+  assert.equal(total, "合计,,,,1,0,0,,,,,1 条没生成、没扣点（原因：参考图没取到），可以直接重跑");
+  assert.doesNotMatch(total, /已提交但服务端还没返回点数/);
+  assert.match(renderCostCsv(state), /A001,main_image,main_image,gpt-image-2.5-2K,1,0,,没扣点,失败/);
+});
+
+test("合计行：生成失败但服务端已结算 0 点 = 不再提示还没返回点数", () => {
+  const state = oneJobState({ status: "failed", requestId: "req-2", generationId: "gen-2", credits: "0", billingStatus: "settled", errorCode: "generation_failed" });
+  assert.equal(costTotalLine(state), "合计,,,,1,0,0,,,,,");
+});
+
+test("合计行：已提交、有生成编号、还没结算 = 保留「已提交但服务端还没返回点数」", () => {
+  const state = oneJobState({ status: "running", requestId: "req-3", generationId: "gen-3", credits: null });
+  assert.equal(costTotalLine(state), "合计,,,,1,0,0,,,,,1 条已提交但服务端还没返回点数");
+});
+
+test("合计行：两类同时有时各说各的；没扣点的原因不认识就写错误码", () => {
+  const state = oneJobState({ status: "failed", requestId: "req-4", charged: false, errorCode: "media_fetch_failed" });
+  state.jobs.push({ ...state.jobs[0], index: 1, slot: "scene", requestId: "req-5", errorCode: "content_rejected" });
+  state.jobs.push({ ...state.jobs[0], index: 2, slot: "detail", status: "running", requestId: "req-6", generationId: "gen-6", charged: null, errorCode: null });
+  assert.equal(
+    costTotalLine(state),
+    "合计,,,,3,0,0,,,,,2 条没生成、没扣点（原因：参考图没取到、content_rejected），可以直接重跑；1 条已提交但服务端还没返回点数",
+  );
+});
+
+test("batch run：服务端回 media_fetch_failed（没有生成编号）→ 清单、状态、--json 都标成没扣点", async () => {
+  const dir = workspace();
+  const server = createServer({
+    onTool: (name, args) => {
+      if (name === "generate_image" && args.options?.template_id === "scene" && args.prompt === "蓝色水杯") {
+        return {
+          structuredContent: { request_id: `r-${args.idempotency_key}`, request_status: "failed", status: "failed", error_code: "media_fetch_failed", message: "x" },
+          isError: false,
+        };
+      }
+      return undefined;
+    },
+  });
+  const out = join(dir, "out");
+  const first = await run(["batch", "run", writeCsv(dir, TWO_BY_TWO), "-m", "gpt-image-2.5-2K", "-o", out, "--yes"], { dir, server });
+  assert.equal(first.code, 3);
+  assert.match(first.stdout, /参考图没取到：服务端去取参考图时失败了，还没开始生成、没扣点/);
+  assert.match(first.stdout, /1 条没生成、没扣点（原因：参考图没取到），可以直接重跑。/);
+
+  const cost = readFileSync(join(out, "cost.csv"), "utf8");
+  assert.match(cost, /B002,scene,scene,gpt-image-2.5-2K,1,0,,没扣点,失败/);
+  assert.match(cost, /合计,,,,4,3,0.15,,,,,1 条没生成、没扣点（原因：参考图没取到），可以直接重跑\r\n$/);
+  assert.doesNotMatch(cost, /已提交但服务端还没返回点数/);
+
+  const status = await run(["batch", "status", out], { dir });
+  assert.match(status.stdout, /1 条没生成、没扣点（原因：参考图没取到），可以直接重跑/);
+
+  const json = JSON.parse((await run(["batch", "status", out, "--json"], { dir })).stdout);
+  const failed = json.jobs.find((j) => j.status === "failed");
+  assert.equal(failed.charged, false);
+  assert.equal(failed.generationId, null);
+  assert.equal(failed.errorCode, "media_fetch_failed");
+  assert.ok(json.jobs.filter((j) => j.status === "done").every((j) => j.charged === null), "成功的不标 charged，以 credits 为准");
 });
 
 // ---------------------------------------------------------------------------

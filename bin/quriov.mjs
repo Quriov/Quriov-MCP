@@ -480,6 +480,7 @@ export function createState({ kind, batchId, specPath = null, specHash = null, o
       serverStatus: null,
       credits: null,
       billingStatus: null,
+      charged: null,
       errorCode: null,
       errorMessage: null,
       files: [],
@@ -599,6 +600,30 @@ const STATUS_LABELS = Object.freeze({
   failed: "失败",
 });
 
+// 「没生成、没扣点」：服务端明确回了失败、而且没给 generation_id（比如取参考图失败 media_fetch_failed，
+// 还没开始生成）。服务端扣点一定挂在一次生成上，没有生成就没有扣点，所以这类可以直接重跑。
+// job.charged：false = 确定没扣点；null = 以服务端返回的点数（credits / billingStatus）为准。
+export function isNotCharged(job) {
+  return job.charged === false;
+}
+
+const NOT_CHARGED_REASONS = Object.freeze({
+  media_fetch_failed: "参考图没取到",
+});
+
+// 合计行 / 状态里的一句话：没扣点的单独说，别和「已提交、还没结算」混在一起。
+export function settlementNote(jobs) {
+  const notCharged = jobs.filter(isNotCharged);
+  const unsettled = jobs.filter((j) => j.requestId && !isNotCharged(j) && (j.credits === null || j.credits === "")).length;
+  const parts = [];
+  if (notCharged.length) {
+    const reasons = [...new Set(notCharged.map((j) => NOT_CHARGED_REASONS[j.errorCode] ?? j.errorCode ?? "未知"))];
+    parts.push(`${notCharged.length} 条没生成、没扣点（原因：${reasons.join("、")}），可以直接重跑`);
+  }
+  if (unsettled) parts.push(`${unsettled} 条已提交但服务端还没返回点数`);
+  return parts.join("；");
+}
+
 // 每张图花了多少点：只写服务端在结果里返回的数，不按价目表推算。
 export function renderCostCsv(state) {
   const header = ["货号", "图位", "模板", "模型", "请求张数", "拿到张数", "点数(服务端返回)", "扣费状态", "状态", "文件", "请求编号", "原因"];
@@ -613,7 +638,7 @@ export function renderCostCsv(state) {
         job.n,
         job.status === "done" || job.status === "download_retry" ? job.mediaCount : 0,
         formatCredits(job.credits),
-        job.billingStatus ?? "",
+        job.billingStatus ?? (isNotCharged(job) ? "没扣点" : ""),
         STATUS_LABELS[job.status] ?? job.status,
         job.files.map((f) => f.replace(`${state.outDir}`, ".").replace(/\\/g, "/")).join(" "),
         job.requestId ?? "",
@@ -624,7 +649,6 @@ export function renderCostCsv(state) {
     );
   }
   const reported = state.jobs.map((j) => j.credits).filter((c) => c !== null && c !== "");
-  const missing = state.jobs.filter((j) => j.requestId && (j.credits === null || j.credits === "")).length;
   lines.push(
     [
       "合计",
@@ -638,7 +662,7 @@ export function renderCostCsv(state) {
       "",
       "",
       "",
-      missing ? `${missing} 条已提交但服务端还没返回点数` : "",
+      settlementNote(state.jobs),
     ]
       .map(csvCell)
       .join(","),
@@ -672,6 +696,7 @@ export function retryFailedJobs(state) {
       serverStatus: null,
       credits: null,
       billingStatus: null,
+      charged: null,
       errorCode: null,
       errorMessage: null,
       files: [],
@@ -729,6 +754,8 @@ export async function runBatch(state, client, {
     if (item.billing_status) job.billingStatus = item.billing_status;
     job.serverStatus = item.status ?? null;
     if (item.request_status === "failed" || item.status === "failed") {
+      // 服务端明确失败且没有生成编号 = 还没开始生成，确定没扣点。
+      if (!job.generationId) job.charged = false;
       failJob(job, item.error_code ?? "generation_failed");
       return;
     }
@@ -1124,6 +1151,8 @@ function describeFinish(state, result) {
   if (c.submitting) lines.push(SENT_UNCONFIRMED_NOTE);
   const credits = sumCredits(state.jobs.map((j) => j.credits));
   lines.push(`已扣点数（服务端返回）合计 ${credits}；明细：${result.costFile}`);
+  const finishNote = settlementNote(state.jobs);
+  if (finishNote) lines.push(`${finishNote}。`);
   if (result.paused) {
     let when = "";
     if (state.pausedUntil) {
@@ -1615,7 +1644,7 @@ async function runCommand(argv, io = {}) {
       }
       if (!state) return batchStatusCommand(rest[0], args, { makeClient, print, log, sleep, now, shouldStop });
       if (args.json) {
-        print(JSON.stringify({ batchId: state.batchId, counts: statusCounts(state), credits: sumCredits(state.jobs.map((j) => j.credits)), pausedUntil: state.pausedUntil, jobs: state.jobs.map(({ args: _a, ...job }) => job) }));
+        print(JSON.stringify({ batchId: state.batchId, counts: statusCounts(state), credits: sumCredits(state.jobs.map((j) => j.credits)), pausedUntil: state.pausedUntil, jobs: state.jobs.map(({ args: _a, ...job }) => ({ ...job, charged: job.charged ?? null })) }));
         return 0;
       }
       const c = statusCounts(state);
@@ -1623,6 +1652,8 @@ async function runCommand(argv, io = {}) {
       print(`  完成 ${c.done} · 失败 ${c.failed} · 生成中 ${c.running} · 待提交 ${c.pending} · ${SENT_UNCONFIRMED} ${c.submitting} · 待下载 ${c.download_retry}，共 ${state.jobs.length}`);
       if (c.submitting) print(`  ${SENT_UNCONFIRMED_NOTE}`);
       print(`  已扣点数（服务端返回）合计 ${sumCredits(state.jobs.map((j) => j.credits))}；明细 ${join(state.outDir, state.costFile)}`);
+      const statusNote = settlementNote(state.jobs);
+      if (statusNote) print(`  ${statusNote}`);
       for (const job of state.jobs.filter((j) => j.status === "failed")) print(`  失败 ${job.sku} / ${job.slot}：${job.errorMessage}`);
       if (isUnfinishedState(state) || c.failed) print(`  接着跑：quriov batch resume ${state.batchId}${c.failed ? " [--retry-failed]" : ""}`);
       print("  （这是本机记录；要看服务端最新进度请运行 resume）");
