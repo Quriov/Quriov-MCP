@@ -29,6 +29,7 @@ import {
   KEYS_PAGE_URL,
   MCP_ENDPOINT,
   ORIGIN,
+  RETIRED_IMAGE_MODELS,
   UPLOAD_ENDPOINT,
   VERSION,
   EXT_BY_TYPE,
@@ -858,7 +859,12 @@ export async function preflight(client, jobs, { withAccount = true } = {}) {
   const errors = [];
   for (const job of jobs) {
     const model = models.get(job.model);
-    if (!model || !model.available || model.modality !== "image") {
+    const replacement = RETIRED_IMAGE_MODELS[job.model];
+    if (replacement) {
+      errors.push(
+        `${job.sku} / ${job.slot}：模型 ${job.model}（Image 2）已停用，请改用同档的 ${replacement}（把 -m 或表里的 model 换掉即可）。没有提交、没有扣费。`,
+      );
+    } else if (!model || !model.available || model.modality !== "image") {
       const usable = [...models.values()].filter((m) => m.available && m.modality === "image").map((m) => m.id);
       errors.push(`${job.sku} / ${job.slot}：模型 ${job.model} 现在不能出图。能用的：${usable.join("、") || "无"}。`);
     }

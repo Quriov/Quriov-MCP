@@ -1,6 +1,6 @@
 {
   "name": "quriov",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Quriov 官方命令行：一条 quriov setup 装好 MCP 和技能，批量出图",
   "type": "module",
   "bin": {
