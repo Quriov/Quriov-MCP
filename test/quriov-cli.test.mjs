@@ -655,9 +655,29 @@ test("模板编号写错：联网校验时就拦下，一张都不提交", async
 test("模型下架 / 写错：联网校验时就拦下并列出能用的", async () => {
   const dir = workspace();
   const server = createServer();
-  const { error } = await run(["gen", "-m", "gpt-image-2", "-p", "杯子", "--yes", "-o", join(dir, "o")], { dir, server });
+  const { error } = await run(["gen", "-m", "no-such-model", "-p", "杯子", "--yes", "-o", join(dir, "o")], { dir, server });
   assert.equal(error.code, "invalid_spec");
-  assert.match(error.message, /gpt-image-2 现在不能出图.*gpt-image-2.5-2K/);
+  assert.match(error.message, /no-such-model 现在不能出图.*gpt-image-2.5-2K/);
+});
+
+for (const [old, replacement] of [
+  ["gpt-image-2", "gpt-image-2.5-1K"],
+  ["gpt-image-2-2K", "gpt-image-2.5-2K"],
+  ["gpt-image-2-4K", "gpt-image-2.5-4K"],
+]) {
+  test(`已停用的 Image 2（${old}）：点名改用 ${replacement}，一张都不提交`, async () => {
+    const dir = workspace();
+    const server = createServer();
+    const { error } = await run(["gen", "-m", old, "-p", "杯子", "--yes", "-o", join(dir, "o")], { dir, server });
+    assert.equal(error.code, "invalid_spec");
+    assert.ok(error.message.includes(`模型 ${old}（Image 2）已停用，请改用同档的 ${replacement}`), error.message);
+    assert.equal(server.toolCalls("generate_image").length, 0);
+  });
+}
+
+test("服务端回 retired_model 时也有中文说明", async () => {
+  const { describeError } = await import("../lib/common.mjs");
+  assert.match(describeError("retired_model"), /gpt-image-2-2K → gpt-image-2.5-2K/);
 });
 
 test("服务端拒绝某一个任务：只这一个失败，原因翻成中文，其余照跑", async () => {
