@@ -5,7 +5,8 @@
 // 一条命令装好（setup：验钥匙、写 MCP 配置、装技能、自检）、读图上传、按表提交、轮询、
 // 下载到文件夹、写出每张花了多少点、断了能接着跑。
 //
-// 模块：lib/transport.mjs 是和服务端说话的唯一出口；lib/setup.mjs 管客户端配置、技能和自检。
+// 模块：lib/transport.mjs 是和服务端说话的唯一出口；lib/setup.mjs 管客户端配置、技能和自检；
+// lib/update.mjs 管升级和「有新版」提示（只连 GitHub 上本仓的发布页，不带钥匙）。
 // 安全边界（见 AGENTS.md）：钥匙永远不从命令行参数读、不打印、不写进日志和批次状态文件。
 
 import {
@@ -59,6 +60,13 @@ import {
   writeClientConfig,
 } from "../lib/setup.mjs";
 import { batchStatusCommand, batchSubmitCommand, jobsCommand } from "../lib/batch.mjs";
+import {
+  NO_UPDATE_CHECK_ENV,
+  runUpdate,
+  startUpdateNotifier,
+  updateCachePath,
+  versionDoctorCheck,
+} from "../lib/update.mjs";
 
 export {
   safeName,
@@ -997,10 +1005,15 @@ export const HELP = `Quriov 官方命令行 ${VERSION} —— 和 Quriov MCP 同
          [--key-stdin]           钥匙从标准输入读（给 AI / 脚本用）
          [--client claude,codex,cursor]  只配这几个客户端（默认：本机装了的都配）
          [--dry-run]             只列出会改哪些文件，什么都不写
-  quriov doctor                  只读自检：钥匙、MCP、客户端配置、技能
+  quriov doctor                  只读自检：钥匙、MCP、客户端配置、技能、是不是最新版
   quriov uninstall [--dry-run]   删掉三个客户端里的 quriov 配置、技能和本机保存的钥匙
   quriov logout                  只删本机保存的钥匙（网页上的钥匙不受影响）
   也可以不 setup，直接设环境变量 QURIOV_API_KEY
+
+升级
+  quriov update [--json]         有新版就下载并装上（装回当前所在的 npm 前缀），已是最新就说一声
+                                 平时每 24 小时查一次新版，有就在标准错误输出提示一行（不影响标准输出）；
+                                 设环境变量 ${NO_UPDATE_CHECK_ENV}=1 关掉
 
 查看（免费）
   quriov account                 余额
@@ -1141,7 +1154,39 @@ function exitCodeFor(state, result) {
   return 0;
 }
 
+// 入口：先在后台查一下有没有新版（io.updateCheck 为真时；真正运行命令行时 cli() 会打开），
+// 再跑命令；命令跑完才往 stderr 提示一行。stdout 不受影响。
 export async function main(argv, io = {}) {
+  let notifier = null;
+  if (io.updateCheck) {
+    try {
+      const { positional, version, help } = parseArgv(argv);
+      const command = positional[0];
+      const env = io.env ?? process.env;
+      // 这几种不提示：看版本 / 看帮助、update 自己会查、doctor 里本来就有版本一项；CI 里不查。
+      const skip = !command || version || help || ["help", "update", "doctor"].includes(command) || Boolean(env.CI);
+      if (!skip) {
+        notifier = startUpdateNotifier({
+          env,
+          cacheFile: updateCachePath(configDir({ env, home: io.home ?? homedir(), platform: io.platform ?? process.platform })),
+          fetchImpl: io.fetchImpl ?? globalThis.fetch,
+          now: io.now ?? Date.now,
+          stderr: io.stderr ?? process.stderr,
+          ...(io.updateTimeoutMs ? { timeoutMs: io.updateTimeoutMs } : {}),
+        });
+      }
+    } catch {
+      notifier = null; // 参数不对等：交给下面报错，这里不管
+    }
+  }
+  try {
+    return await runCommand(argv, io);
+  } finally {
+    if (notifier) await notifier.finish();
+  }
+}
+
+async function runCommand(argv, io = {}) {
   const {
     env = process.env,
     stdout = process.stdout,
@@ -1308,10 +1353,45 @@ export async function main(argv, io = {}) {
   if (command === "doctor") {
     const { key, source, fallbacks } = requireKey(where);
     const client = new QuriovClient({ key, keySource: source, fallbacks, fetchImpl, sleep, now, log });
-    const result = await runDoctor({ client, targets: clientTargets(where) });
+    const result = await runDoctor({
+      client,
+      targets: clientTargets(where),
+      versionCheck: () => versionDoctorCheck({ env, cacheFile: updateCachePath(configDir(where)), fetchImpl, now }),
+    });
     print(renderDoctor(result));
     staleKeyHint(client);
     return result.ok ? 0 : 1;
+  }
+
+  if (command === "update") {
+    const result = await runUpdate({
+      fetchImpl,
+      platform,
+      cacheFile: updateCachePath(configDir(where)),
+      now,
+      log,
+      ...(io.packageRoot ? { packageRoot: io.packageRoot } : {}),
+      ...(io.tmpDir ? { tmpDir: io.tmpDir } : {}),
+      ...(io.runNpm ? { runNpm: io.runNpm } : {}),
+      // 装好后把本机已装的技能同步成新版（技能文件随包更新，这里只是复制过去；没装过的不新装）。
+      afterInstall: async () => {
+        const refreshed = [];
+        for (const d of skillDirsFor(clientTargets(where))) {
+          if (existsSync(join(d.dir, "quriov", "SKILL.md"))) refreshed.push(installSkill(d.dir).file);
+        }
+        return refreshed;
+      },
+    });
+    if (args.json) {
+      print(JSON.stringify({ updated: result.updated, current: result.current, latest: result.latest, message: result.message }));
+      return 0;
+    }
+    print(result.message);
+    if (result.updated) {
+      for (const file of result.refreshedSkills ?? []) print(`技能已同步成新版：${file}`);
+      print("接着运行 quriov doctor 检查一遍；已经开着的 AI 会话要新开一个才会用上新技能。");
+    }
+    return 0;
   }
 
   if (command === "uninstall") {
@@ -1592,7 +1672,7 @@ async function cli() {
     process.stderr.write("\n收到中断：进度都已存盘。再按一次 Ctrl+C 立即退出；之后用 quriov batch resume <批次号> 接着跑。\n");
   });
   try {
-    process.exitCode = await main(process.argv.slice(2), { shouldStop: () => stopRequested });
+    process.exitCode = await main(process.argv.slice(2), { shouldStop: () => stopRequested, updateCheck: true });
   } catch (error) {
     const wantsJson = process.argv.slice(2).includes("--json");
     if (error instanceof CliError) {

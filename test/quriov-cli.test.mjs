@@ -11,6 +11,7 @@ import {
   MCP_ENDPOINT,
   QuriovClient,
   UPLOAD_ENDPOINT,
+  VERSION,
   loadSpec,
   main,
   parseArgv,
@@ -38,8 +39,9 @@ function toolError(code, extra = {}) {
   return { isError: true, content: [{ type: "text", text: `Error executing tool x: ${JSON.stringify(body)}` }] };
 }
 
-function createServer({ pollsUntilDone = 1, onTool = null, onHttp = null } = {}) {
+function createServer({ pollsUntilDone = 1, onTool = null, onHttp = null, latestVersion = null } = {}) {
   const server = {
+    githubCalls: 0,
     generations: new Map(), // idempotency_key -> gen
     calls: [], // { kind, name, args }
     downloads: [], // { url, headers }
@@ -137,6 +139,13 @@ function createServer({ pollsUntilDone = 1, onTool = null, onHttp = null } = {})
 
   server.fetch = async (url, init = {}) => {
     const headers = init.headers ?? {};
+    // doctor 的版本一项查 GitHub 发布页：不许带钥匙。latestVersion 不给 = 就是当前版本。
+    if (typeof url === "string" && url.startsWith("https://api.github.com/")) {
+      assert.equal(url, "https://api.github.com/repos/Quriov/Quriov-MCP/releases/latest");
+      assert.equal(headers.Authorization, undefined, "查新版不能带钥匙");
+      server.githubCalls += 1;
+      return jsonResponse({ tag_name: `v${latestVersion ?? VERSION}`, assets: [] });
+    }
     if (typeof url === "string" && url.startsWith("https://oss.example.test/")) {
       server.downloads.push({ url, headers });
       return new Response(new Uint8Array([137, 80, 78, 71, 1, 2, 3, 4]), { status: 200 });
@@ -301,7 +310,7 @@ test("--help 列出全部命令", async () => {
   const dir = workspace();
   const { code, stdout } = await run(["--help"], { dir });
   assert.equal(code, 0);
-  for (const word of ["quriov setup", "quriov doctor", "quriov uninstall", "quriov upload", "quriov models", "quriov gen", "batch plan", "batch run", "batch status", "batch resume", "https://quriovai.com/install.md"]) {
+  for (const word of ["quriov setup", "quriov doctor", "quriov update", "QURIOV_NO_UPDATE_CHECK", "quriov uninstall", "quriov upload", "quriov models", "quriov gen", "batch plan", "batch run", "batch status", "batch resume", "https://quriovai.com/install.md"]) {
     assert.ok(stdout.includes(word), word);
   }
   assert.equal(stdout.trim(), HELP.trim());
@@ -828,10 +837,11 @@ test("setup：三个客户端都写好、保留别的配置、装技能、自检
   await runSetup(["setup", "--key-stdin"], { dir, server, home });
   assert.equal(readFileSync(join(home, ".codex", "config.toml"), "utf8").match(/\[mcp_servers\.quriov\]/g).length, 1);
 
-  // doctor：只读，四项全过
+  // doctor：只读，四项全过，外加一项版本
   const doctor = await runSetup(["doctor"], { dir, server, home });
   assert.equal(doctor.code, 0, doctor.stdout);
-  assert.equal(doctor.stdout.trim().split("\n").length, 4);
+  assert.equal(doctor.stdout.trim().split("\n").length, 5);
+  assert.match(doctor.stdout, new RegExp(`\\[通过\\] 版本：v${VERSION.replace(/\./g, "\\.")}，已是最新`));
   assert.ok(!doctor.stdout.includes(TEST_KEY));
 
   // uninstall：只删 quriov 那一项、技能和保存的钥匙，别的原样
@@ -923,6 +933,42 @@ test("doctor：服务端少了核心工具才算没过；多了新工具照样�
   const { code, stdout } = await runSetup(["doctor"], { dir, server, home, extraEnv: { QURIOV_API_KEY: TEST_KEY } });
   assert.equal(code, 1);
   assert.match(stdout, /缺少：estimate_cost、generate_image/);
+});
+
+test("doctor：有新版时版本一项标「提示」、叫你运行 quriov update，自检照样算通过", async () => {
+  const dir = workspace();
+  const home = fakeHome(dir);
+  const server = createServer({ latestVersion: "99.0.0" });
+  const { code, stdout } = await runSetup(["doctor"], { dir, server, home, extraEnv: { QURIOV_API_KEY: TEST_KEY } });
+  assert.equal(code, 0, stdout);
+  assert.match(stdout, new RegExp(`\\[提示\\] 版本：当前 v${VERSION.replace(/\./g, "\\.")}，最新 v99\\.0\\.0：运行 quriov update 升级`));
+  assert.equal(server.githubCalls, 1);
+  // 查到的结果顺手记进缓存，自动提示 24 小时内不用再查
+  const cache = JSON.parse(readFileSync(join(dir, "config", "quriov", "update-check.json"), "utf8"));
+  assert.equal(cache.latest, "99.0.0");
+});
+
+test("doctor：连不上 GitHub 时版本一项只提示查不到，不算没过", async () => {
+  const dir = workspace();
+  const home = fakeHome(dir);
+  const server = createServer({ onHttp: () => undefined });
+  const offline = async (url, init) => {
+    if (String(url).startsWith("https://api.github.com/")) throw new TypeError("fetch failed");
+    return server.fetch(url, init);
+  };
+  const { code, stdout } = await runWith(["doctor"], { dir, fetchImpl: offline, envVars: { QURIOV_API_KEY: TEST_KEY, HOME: home } });
+  assert.equal(code, 0, stdout);
+  assert.match(stdout, /\[提示\] 版本：当前 v.+：查不到最新版本（连不上 GitHub）/);
+});
+
+test("doctor：QURIOV_NO_UPDATE_CHECK=1 时版本一项不联网", async () => {
+  const dir = workspace();
+  const home = fakeHome(dir);
+  const server = createServer();
+  const { code, stdout } = await runSetup(["doctor"], { dir, server, home, extraEnv: { QURIOV_API_KEY: TEST_KEY, QURIOV_NO_UPDATE_CHECK: "1" } });
+  assert.equal(code, 0, stdout);
+  assert.equal(server.githubCalls, 0);
+  assert.match(stdout, /\[提示\] 版本：当前 v.+：已用 QURIOV_NO_UPDATE_CHECK 关掉联网查新版/);
 });
 
 test("upload：打印链接给 MCP 用，不打印钥匙", async () => {

@@ -14,7 +14,8 @@ Quriov（https://quriovai.com）出图出视频的官方命令行。一条 `quri
 
 ```text
 quriov setup              # 装好 / 修好：验钥匙、写 MCP、装技能、自检（--dry-run 只看不写）
-quriov doctor             # 只读自检：钥匙、MCP、客户端配置、技能
+quriov doctor             # 只读自检：钥匙、MCP、客户端配置、技能、是不是最新版
+quriov update             # 有新版就下载并装上；已是最新就说一声
 quriov uninstall          # 删掉 quriov 写过的配置、技能和本机保存的钥匙
 quriov account            # 余额
 quriov models             # 能用的模型、模板编号、每张多少点
@@ -37,6 +38,19 @@ quriov jobs cancel <任务号>                                           # 取�
 以上命令加 `--json` 输出机器可读的结果（给 AI / 脚本用）；出错时 JSON 里有 `error_code`、中文 `reason`、`request_id`。
 
 `quriov --help` 有完整用法和退出码。
+
+## 更新
+
+```text
+quriov update
+```
+
+查 GitHub 上本仓的最新发布版，比当前新就下载 `quriov.tgz` 到临时目录，再用 `npm install -g` 装回**当前这份 quriov 所在的位置**（装在自定义 `--prefix` 的也装回原处）；本机已装的技能一起同步成新版。已是最新就只说一句。装完运行 `quriov doctor` 检查一遍。
+
+- 平时运行任何命令时，距上次检查超过 24 小时就顺手在后台查一次（最多等 2 秒，查不到不出声），有新版就在**标准错误输出**提示一行；标准输出不受影响，`--json` 的结果照样能被程序解析。结果缓存在配置目录（和保存的钥匙同一个目录）的 `update-check.json`。
+- 不想让它查：设环境变量 `QURIOV_NO_UPDATE_CHECK=1`（CI 环境里本来就不查）。
+- 国内网络连不上 GitHub 时，`update` 会给出发布页的下载地址：用浏览器下载后运行 `npm install -g <下载的文件>`（Windows 用 `npm.cmd`）。
+- 权限不够（EACCES）时按提示改装到自己的目录，和安装说明里的做法一致。
 
 ## 批量表格
 
@@ -87,6 +101,6 @@ quriov jobs cancel <任务号>                                           # 取�
 - 钥匙只从隐藏输入、标准输入（`--key-stdin`）或环境变量 `QURIOV_API_KEY` 读，**永远不从命令参数读**；不打印、不写进日志和批次存档。
 - 用哪把钥匙：环境变量 `QURIOV_API_KEY` > `quriov setup` 保存的 > 旧环境变量名；`account` / `doctor` / 报错都会说正在用哪一把。第一把没通过验证时自动换下一把，并提醒你删掉失效的环境变量。
 - `setup` 把钥匙存进本机用户目录（仅本人可读写），并写进三个客户端的用户级 MCP 配置（图形版客户端读不到 shell 里的环境变量）。卸载不会作废钥匙，作废请到网页撤销。
-- 零依赖，只用 Node 20+ 自带的功能；只连 `https://quriovai.com` 和它返回的结果图链接。
+- 零依赖，只用 Node 20+ 自带的功能；只连 `https://quriovai.com` 和它返回的结果图链接，外加查新版 / 升级时连 GitHub 上本仓的发布页（`api.github.com` 与 `github.com`，不带钥匙）。
 
 漏洞报告见 [SECURITY.md](SECURITY.md)。许可：[MIT](LICENSE)。
