@@ -1,6 +1,6 @@
 ---
 name: quriov
-description: 用 Quriov 出图出视频：聊天里出一两张走 Quriov MCP 工具；批量（多个货号 × 多个图位）、本地参考图、要把图存进文件夹、按任务号查结果 / 翻历史 / 取消走命令行 quriov。用户要生成商品图、电商套图、带参考图出图、批量出图、查出图结果或生成视频时使用。
+description: 用 Quriov 出图出视频：聊天里出一两张走 Quriov MCP 工具；批量（多个货号 × 多个图位）、详情套图（详情页模块图）、本地参考图、要把图存进文件夹、按任务号查结果 / 翻历史 / 取消走命令行 quriov。用户要生成商品图、电商套图、详情图、带参考图出图、批量出图、查出图结果或生成视频时使用。
 ---
 
 # Quriov 出图 / 出视频
@@ -12,6 +12,7 @@ MCP 工具（名为 `quriov` 的 MCP 服务）和命令行 `quriov` 用**同一�
 | 批量，条目由你（AI）整理好：参考图已是 https 链接或没有参考图，每条可带多个模板 | 命令行 `quriov batch submit`（整批交给服务端）+ `quriov batch status --wait --download` |
 | 批量，手上是一张表 + 本地参考图，要一张费用清单 | 命令行 `quriov batch plan / run`（本机按表跑，自动上传参考图） |
 | 本地参考图（尤其是真实照片） | 命令行 `quriov gen --ref` / `quriov batch run`（自动上传）；或先 `quriov upload` 换成链接 |
+| 详情图 / 详情套图（痛点、核心卖点、技术细节、颜色等详情页模块图） | 命令行 `quriov aplus run`（MCP 里没有这条通道；不要用普通出图加脚本排版去凑） |
 | 按任务号查结果、翻历史、取消排队中的任务 | 命令行 `quriov jobs get / list / query / cancel` |
 | 聊天里出一两张、边看边改；出视频 | MCP 工具 |
 
@@ -80,6 +81,31 @@ quriov gen -m <模型> -p "白底主图，正面平铺" --ref a.jpg --ref b.jpg 
 **不会重复扣钱**：没填 `idempotency_key` 时按条目内容自动算，同一个文件原样重跑，服务端认出来直接返回原任务。所以中途断了、超时了、余额不足充值后，**原样重跑同一条命令**即可接着交完。真想把同一份内容再出一遍，就改内容或给一个新的 `idempotency_key`（会再花钱，先估价再确认）。
 
 单个任务：`quriov jobs get <job_id>`；一串：`quriov jobs query <id...>`；历史：`quriov jobs list --tag SKU123 --status failed --all`；取消排队中的：`quriov jobs cancel <job_id>`（已在生成的不能取消）。
+
+## 详情套图（命令行 aplus）
+
+一张参考图 + 卖点 → 一组详情页模块图。每个模块按所选型号的单张价各扣一次，出不来的模块不收费。
+
+```bash
+quriov aplus modules --json     # 能用的模块编号（以实时结果为准，别凭记忆写）
+```
+
+固定流程：
+
+1. 估价（免费，不提交）：
+   `quriov aplus run --modules <编号,编号…> --ref <本地参考图> --point "<卖点>" [--point "…"] --estimate --json`
+   模块按给的顺序出，一次 1–5 个；正好 1 张参考图（不超过 10 MB）；卖点至少一条（多条就多写几次 `--point`，或用 `--points-file`）。参数有问题会一次全列出来，不提交。
+2. 把估价原样告诉用户（几个模块、每个多少点、合计、余额），取得明确确认。
+3. 同一条命令去掉 `--estimate`，加 `-o ./out --yes --json`：提交、等结果、下载成 `out/<序号>-<模块编号>.png`。
+4. 汇报：任务编号（`job_id`）、每个模块对应的文件、每个模块的扣点和 `total_credits`；`failed_modules` 里的照实说失败和原因，不冒充整套成功。
+
+**这条通道不去重**：同样的内容再交一次 = 再扣一次钱。所以：
+
+- 报「提交结果不确定」（断网 / 超时 / 服务端出错，退出码 4）时**不要直接重跑**：先 `quriov aplus jobs --json` 看最近的任务里有没有这一条；有就 `quriov aplus status <任务编号> --wait --download ./out --json` 接着等。
+- 等结果时断了、超时了：任务还在服务端跑，同样用 `aplus status … --wait --download` 接着等，不要重新提交。
+- 有模块失败（退出码 3）：只带失败的那几个模块重新提交，先估价再确认。
+
+要超过 5 个模块就分几次提交。选了尺码表模块必须用 `--size-chart <json 文件>` 给真实尺码数据。
 
 ## 聊天里出图 / 出视频（MCP）
 
