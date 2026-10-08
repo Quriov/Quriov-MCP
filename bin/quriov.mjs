@@ -39,6 +39,7 @@ import {
   realSleep,
   safeName,
   sha256,
+  sumCredits,
   writeAtomic,
 } from "../lib/common.mjs";
 import {
@@ -60,6 +61,7 @@ import {
   writeClientConfig,
 } from "../lib/setup.mjs";
 import { batchStatusCommand, batchSubmitCommand, jobsCommand } from "../lib/batch.mjs";
+import { aplusCommand } from "../lib/aplus.mjs";
 import {
   NO_UPDATE_CHECK_ENV,
   runUpdate,
@@ -79,6 +81,7 @@ export {
   VERSION,
   describeError,
   parseToolError,
+  sumCredits,
 };
 
 // 钥匙的环境变量：QURIOV_API_KEY 是正式名字；另外三个是以前在不同地方出现过的旧名字，照认。
@@ -175,27 +178,6 @@ export function saveKey(key, { path, env = process.env, home, platform } = {}) {
 function formatCredits(value) {
   if (value === null || value === undefined || value === "") return "";
   return String(value);
-}
-
-function addDecimal(a, b) {
-  // 点数是十进制字符串；用放大到整数的方式相加，避免 0.1 + 0.2 这类浮点误差。
-  const scale = 1_000_000n;
-  const toInt = (v) => {
-    const [whole, frac = ""] = String(v).split(".");
-    const sign = whole.startsWith("-") ? -1n : 1n;
-    const w = BigInt(whole.replace("-", "") || "0");
-    const f = BigInt((frac + "000000").slice(0, 6));
-    return sign * (w * scale + f);
-  };
-  const total = toInt(a) + toInt(b);
-  const sign = total < 0n ? "-" : "";
-  const abs = total < 0n ? -total : total;
-  const frac = (abs % scale).toString().padStart(6, "0").replace(/0+$/, "");
-  return `${sign}${abs / scale}${frac ? `.${frac}` : ""}`;
-}
-
-export function sumCredits(values) {
-  return values.filter((v) => v !== null && v !== undefined && v !== "").reduce(addDecimal, "0");
 }
 
 // ---------------------------------------------------------------------------
@@ -960,6 +942,14 @@ const FLAG_SPEC = Object.freeze({
   "--until": "until",
   "--limit": "limit",
   "--cursor": "cursor",
+  "--modules": "modules",
+  "--point": "point",
+  "--points-file": "pointsFile",
+  "--style": "style",
+  "--headline": "headline",
+  "--subheadline": "subheadline",
+  "--category": "category",
+  "--size-chart": "sizeChart",
 });
 const BOOLEAN_FLAGS = Object.freeze({
   "--yes": "yes",
@@ -969,6 +959,7 @@ const BOOLEAN_FLAGS = Object.freeze({
   "--json": "json",
   "--retry-failed": "retryFailed",
   "--wait": "wait",
+  "--no-wait": "noWait",
   "--all": "all",
   "--help": "help",
   "-h": "help",
@@ -1003,6 +994,7 @@ export function parseArgv(argv) {
       const value = inline ?? argv[(i += 1)];
       if (value === undefined) throw new CliError("usage", `${arg} 后面要跟一个值。`, { exitCode: 2 });
       if (name === "ref") out.ref.push(value);
+      else if (name === "point") (out.point ??= []).push(value);
       else out[name] = value;
       continue;
     }
@@ -1071,6 +1063,21 @@ export const HELP = `Quriov 官方命令行 ${VERSION} —— 和 Quriov MCP 同
                                  [--chunk-size 1-50]
   quriov batch status <批次号> [--wait] [--download 目录] [--poll-seconds 15] [--timeout 180] [--json]
                                  --wait 等到全部结束；--download 按 标记/模板 命名下载结果图
+
+详情套图（一张参考图 + 卖点 → 一组详情模块图；每个模块按所选型号的单张价各扣一次）
+  quriov aplus modules [--json]  能用的详情模块编号（免费）
+  quriov aplus run --modules <编号,编号…> --ref <参考图> --point "<卖点>" [--point "…"] -o ./out
+                   [--points-file 卖点.txt] [-m <型号>] [-p "<商品描述>"] [--style "<风格>"]
+                   [--headline "<主标题>"] [--subheadline "<副标题>"] [--category <品类>]
+                   [--size-chart 尺码表.json] [--estimate] [--dry-run] [--yes] [--no-wait]
+                   [--poll-seconds 10] [--timeout 30] [--json]
+                                 模块按给的顺序出，一次 1–5 个、1 张参考图（≤10 MB）；先估价再确认，
+                                 提交、等结果、下载成 out/<序号>-<模块编号>.png，列出每个模块的扣点和合计。
+                                 --estimate 只估价（免费，不提交）；--dry-run 不联网只看计划；
+                                 --no-wait 提交后只打印任务编号。提交没有去重：结果不确定时不会自动重交，
+                                 先用 quriov aplus jobs 看有没有这条任务
+  quriov aplus status <任务编号> [--wait] [--download 目录] [--json]
+  quriov aplus jobs [--limit 1-100] [--cursor c] [--json]     最近 7 天的详情套图任务
 
 任务（按任务号查 / 翻历史 / 取消）
   quriov jobs get <任务号> [--json]
@@ -1690,6 +1697,19 @@ async function runCommand(argv, io = {}) {
 
   if (command === "jobs") {
     return jobsCommand(sub, rest, args, { makeClient, print, log, stdin });
+  }
+
+  if (command === "aplus") {
+    return aplusCommand(sub, rest, args, {
+      makeClient,
+      print,
+      log,
+      stdin,
+      sleep,
+      now,
+      shouldStop,
+      confirm: (q) => confirm(q, { stdin, stderr }),
+    });
   }
 
   throw new CliError("usage", `不认识的命令 ${command}。运行 quriov --help 看用法。`, { exitCode: 2 });

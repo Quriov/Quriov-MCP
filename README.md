@@ -4,7 +4,7 @@ Quriov（https://quriovai.com）出图出视频的官方命令行。一条 `quri
 
 - **MCP**：给本机的 Claude Code / Codex / Cursor 写好名为 `quriov` 的 MCP，聊天里就能出图出视频；
 - **技能**：教 AI 什么时候用 MCP、什么时候用命令行、花钱前先估价；
-- **命令行**：批量出图（一张表，每行一个商品）、本地参考图自动上传、结果下载到文件夹、每张花多少点写进 `cost.csv`、断了接着跑不重复扣钱。
+- **命令行**：批量出图（一张表，每行一个商品）、详情套图（一张参考图 + 卖点出一组详情模块图）、本地参考图自动上传、结果下载到文件夹、每张花多少点写进 `cost.csv`、断了接着跑不重复扣钱。
 
 ## 安装
 
@@ -33,6 +33,12 @@ quriov jobs get <任务号>                                              # 按�
 quriov jobs list --tag SKU123 --status failed --all                  # 翻历史（自动翻页）
 quriov jobs query <任务号...>                                          # 一次查多个
 quriov jobs cancel <任务号>                                           # 取消还在排队的（不扣费）
+
+quriov aplus modules                                                 # 详情套图：能用的模块编号
+quriov aplus run --modules <编号,编号…> --ref a.jpg --point "卖点" --estimate   # 只估价，不花钱
+quriov aplus run --modules <编号,编号…> --ref a.jpg --point "卖点" -o ./out      # 确认后提交、等结果、下载
+quriov aplus status <任务编号> --wait --download ./out                # 接着等 / 重新下载
+quriov aplus jobs                                                    # 最近 7 天的详情套图任务
 ```
 
 以上命令加 `--json` 输出机器可读的结果（给 AI / 脚本用）；出错时 JSON 里有 `error_code`、中文 `reason`、`request_id`。
@@ -95,6 +101,31 @@ quriov update
 - 中途断了、超时了、充值后：原样重跑同一条命令，已交的原样返回、不扣钱，没交上的补交。
 - `batch status <批次号> --download ./out` 把结果存成 `out/<tag>/<模板>.png`（同一模板多张时加 `-1`、`-2`）；结果云端只留 1 天。
 - 只有服务端临时不可用（HTTP 503）会按它给的等待时间自动重试几次；其余错误不重试，报出中文原因、错误码和请求编号。
+
+## 详情套图（`aplus`）
+
+一张参考图 + 几条卖点，出一组详情页模块图（痛点、核心卖点、技术细节、颜色……）。模块编号用 `quriov aplus modules` 查。
+
+```text
+quriov aplus run --modules aplus_pain_points,aplus_key_features,aplus_technology_detail,aplus_color_options \
+  --ref ./product.jpg --point "续航 40 小时" --point "IPX7 防水" -p "蓝牙运动耳机，黑色" -o ./out
+```
+
+| 参数 | 意思 |
+| --- | --- |
+| `--modules` | 模块编号，逗号隔开，**按给的顺序出**；一次 1–5 个，不能重复 |
+| `--ref` | 正好 1 张本地参考图（JPG / PNG / WebP，不超过 10 MB） |
+| `--point` | 一条卖点，可以写多次；也可以 `--points-file 卖点.txt`（一行一条，或 JSON 字符串数组）。至少一条 |
+| `-m` | 型号，不写用默认档；`quriov models` 看每张多少点 |
+| `-p` / `--style` / `--headline` / `--subheadline` / `--category` | 商品描述 / 风格 / 主标题 / 副标题 / 品类（都可不填） |
+| `--size-chart` | 尺码表 JSON 文件（`{"headers": [...], "rows": [[...]], "unit": "cm"}`）；选了尺码表模块就必须给 |
+| `-o` | 输出目录，默认 `./quriov-out` |
+
+- **扣费**：每个模块按所选型号的单张价各扣一次，出不来的模块不收费。`--estimate` 联网估价（免费，不提交）；真提交前会再显示一次估价并要确认（非交互加 `--yes`）；余额不够时不提交。
+- **结果**：存成 `out/01-<模块编号>.png`、`out/02-…`（序号 = 你给的顺序）；输出里有任务编号、每个模块的状态 / 扣点 / 文件，和实扣合计。`--json` 给机器读。
+- **退出码**：全部成功 0；有模块失败（成功的照样下载、照实列出）3；等超时或提交结果不确定 4。
+- **不会自动重交**：这个接口不去重，同样的内容再交一次就是再扣一次钱。提交时断网 / 超时 / 服务端出错，命令行只报「结果不确定」，请先 `quriov aplus jobs` 看有没有这条任务，有就用 `quriov aplus status <任务编号> --wait --download ./out` 接着等。
+- `--no-wait` 提交后只打印任务编号；`--dry-run` 不联网只看计划。
 
 ## 钥匙与安全
 
