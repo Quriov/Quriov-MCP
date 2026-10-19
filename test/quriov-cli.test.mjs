@@ -17,6 +17,8 @@ import {
   parseArgv,
   parseCsv,
   createState,
+  runBatch,
+  retryFailedJobs,
   renderCostCsv,
   requireKey,
   resolveKeys,
@@ -169,6 +171,20 @@ function createServer({ pollsUntilDone = 1, onTool = null, onHttp = null, latest
         size_bytes: 8,
         content_type: "image/png",
       });
+    }
+    if (url === "https://quriovai.com/api/v1/mcp/jobs/query") {
+      const { job_ids: ids } = JSON.parse(init.body);
+      server.calls.push({ kind: "query", ids });
+      const items = [];
+      for (const gen of server.generations.values()) {
+        if (!ids.includes(gen.requestId) && !ids.includes(gen.generationId)) continue;
+        gen.polls += 1;
+        if (gen.polls >= pollsUntilDone && gen.status !== "failed") gen.status = "succeeded";
+        const view = genView(gen);
+        items.push({ job_id: gen.requestId, idempotency_key: gen.args.idempotency_key, status: view.status, media: view.media,
+          settled_credits: view.credits, billing_status: view.billing_status });
+      }
+      return jsonResponse({ items, missing: ids.filter((id) => !items.some((item) => item.job_id === id)) });
     }
     assert.equal(url, MCP_ENDPOINT);
     const request = JSON.parse(init.body);
@@ -544,6 +560,151 @@ test("batch run：输出目录里已有批次时拒绝，提示用 resume", asyn
   const again = await run(["batch", "run", csv, "-m", "gpt-image-2.5-2K", "-o", out, "--yes"], { dir, server });
   assert.equal(again.error?.code, "out_dir_in_use");
   assert.match(again.error.message, /quriov batch resume/);
+});
+
+test("精确恢复：旧成功不在recent、被误标丢失，download-only补图但不交pending", async () => {
+  const dir = workspace();
+  const out = join(dir, "out");
+  const server = createServer();
+  await run(["batch", "run", writeCsv(dir, TWO_BY_TWO), "-m", "gpt-image-2.5-2K", "-o", out, "--yes", "--concurrency", "2"], {
+    dir, server, shouldStop: () => server.generations.size >= 2,
+  });
+  const path = join(out, ".quriov", stateFiles(join(out, ".quriov"))[0]);
+  const state = JSON.parse(readFileSync(path, "utf8"));
+  state.jobs[0].status = "failed";
+  state.jobs[0].errorCode = "lost_from_history";
+  writeFileSync(path, JSON.stringify(state));
+  const before = state.jobs.slice(0, 2).map((j) => [j.requestId, j.generationId, j.idempotencyKey, j.attempt]);
+  const submits = server.toolCalls("generate_image").length;
+  const uploads = server.uploads;
+  server.tools.list_generations = () => assert.fail("不能依赖recent列表");
+
+  const result = await run(["batch", "resume", out, "--download-only"], { dir, server });
+  assert.equal(result.error, null);
+  assert.equal(result.code, 4, "pending保持未提交，不能报整批完成");
+  assert.equal(server.toolCalls("generate_image").length, submits);
+  assert.equal(server.uploads, uploads);
+  const recovered = JSON.parse(readFileSync(path, "utf8"));
+  assert.deepEqual(recovered.jobs.map((j) => j.status), ["done", "done", "pending", "pending"]);
+  assert.deepEqual(recovered.jobs.slice(0, 2).map((j) => [j.requestId, j.generationId, j.idempotencyKey, j.attempt]), before);
+  assert.ok(recovered.jobs.slice(0, 2).every((j) => j.files.every(existsSync)));
+  assert.match(readFileSync(join(out, "cost.csv"), "utf8"), /0.05,settled,完成/);
+  assert.match(result.stdout, /不上传、不生成、不重发/);
+  const bytes = recovered.jobs.slice(0, 2).map((j) => readFileSync(j.files[0], "hex"));
+  const downloads = server.downloads.length;
+  await run(["batch", "resume", out, "--download-only"], { dir, server });
+  assert.equal(server.downloads.length, downloads, "已成功落盘的文件不覆盖或重新下载");
+  assert.deepEqual(recovered.jobs.slice(0, 2).map((j) => readFileSync(j.files[0], "hex")), bytes);
+});
+
+test("精确查不到原ID时暂停，不能把查不到认成生图失败后重交", async () => {
+  const dir = workspace();
+  const out = join(dir, "out");
+  const server = createServer();
+  await run(["batch", "run", writeCsv(dir, TWO_BY_TWO), "-m", "gpt-image-2.5-2K", "-o", out, "--yes", "--concurrency", "1"], {
+    dir, server, shouldStop: () => server.generations.size >= 1,
+  });
+  server.generations.clear();
+  const result = await run(["batch", "resume", out, "--concurrency", "1"], { dir, server });
+  assert.equal(result.error, null);
+  assert.equal(result.code, 4);
+  assert.equal(server.toolCalls("generate_image").length, 1);
+  const path = join(out, ".quriov", stateFiles(join(out, ".quriov"))[0]);
+  const job = JSON.parse(readFileSync(path, "utf8")).jobs[0];
+  assert.equal(job.status, "running");
+  assert.equal(job.requestId, "req-1");
+  assert.equal(job.attempt, 1);
+  assert.match(result.stderr, /保留编号并暂停/);
+});
+
+test("只下载模式拒绝与付费重试或batch run混用，在联网前阻止", async () => {
+  for (const args of [
+    ["batch", "resume", ".", "--download-only", "--retry-failed", "--yes"],
+    ["batch", "run", "x.csv", "--download-only", "--yes"],
+  ]) {
+    const result = await run(args, { dir: workspace() });
+    assert.equal(result.error?.code, "usage");
+    assert.equal(result.error?.exitCode, 2);
+  }
+});
+
+test("误标丢失的旧任务即使要求retry-failed也先精确找回，原ID和attempt不变", () => {
+  const state = { jobs: [{ status: "failed", errorCode: "lost_from_history", requestId: "old-request", generationId: "old-generation", attempt: 1, idempotencyKey: "old-key" }] };
+  assert.equal(retryFailedJobs(state), 0, "不是一个新付费重试");
+  assert.deepEqual(state.jobs[0], { status: "running", errorCode: "lost_from_history", requestId: "old-request", generationId: "old-generation", attempt: 1, idempotencyKey: "old-key" });
+});
+
+test("精确恢复按接口上限分块；真实失败保留，pending不动，缺媒体不冒充已下载", async () => {
+  const dir = workspace();
+  const state = createState({ kind: "batch", batchId: "old-batch", outDir: join(dir, "out"),
+    jobs: Array.from({ length: 203 }, (_, i) => ({ sku: `S${i}`, slot: "image", model: "gpt-image-2.5-2K", n: 1, refs: [], prompt: "test" })) });
+  state.jobs.slice(0, 202).forEach((j, i) => Object.assign(j, { status: "running", requestId: `old-${i}`, generationId: `gen-${i}`, idempotencyKey: `key-${i}` }));
+  const queries = [];
+  const client = {
+    async queryJobs(ids) {
+      queries.push(ids);
+      return { items: ids.map((id) => ({ job_id: id, status: id === "old-200" ? "failed" : "succeeded", billing_status: id === "old-200" ? "none" : "settled",
+        settled_credits: id === "old-200" ? null : "0.0400", error_code: id === "old-200" ? "media_fetch_failed" : null,
+        media: ["old-200", "old-201"].includes(id) ? [] : [{ type: "image", url: "https://oss.example.test/image.png", content_type: "image/png" }] })), missing: [] };
+    },
+    async download(_url, path) { mkdirSync(join(path, ".."), { recursive: true }); writeFileSync(path, "image"); },
+    async generateImage() { assert.fail("不得生成"); },
+    async upload() { assert.fail("不得上传"); },
+    async listGenerations() { assert.fail("不得使用recent列表"); },
+  };
+  const result = await runBatch(state, client, { downloadOnly: true });
+  assert.deepEqual(queries.map((q) => q.length), [200, 2]);
+  assert.equal(state.jobs.filter((j) => j.status === "done").length, 200);
+  assert.equal(state.jobs[200].status, "failed");
+  assert.equal(state.jobs[200].charged, false);
+  assert.equal(state.jobs[201].status, "running", "成功却缺媒体不能报已下载");
+  assert.equal(state.jobs[202].status, "pending");
+  assert.equal(result.paused.code, "result_unavailable");
+});
+
+test("记录清理仅暂停，不能被当作生成失败清编号后付费重试", async () => {
+  const dir = workspace();
+  const state = createState({ kind: "batch", batchId: "expired-batch", outDir: join(dir, "out"),
+    jobs: [{ sku: "S", slot: "image", model: "gpt-image-2.5-2K", n: 1, refs: [], prompt: "test" }] });
+  Object.assign(state.jobs[0], { status: "running", requestId: "old-request", generationId: "old-generation", idempotencyKey: "old-key" });
+  const original = [state.jobs[0].requestId, state.jobs[0].generationId, state.jobs[0].idempotencyKey, state.jobs[0].attempt];
+  const result = await runBatch(state, {
+    async queryJobs() { return { items: [{ job_id: "old-request", status: "expired", error_code: "result_expired", media: [] }], missing: [] }; },
+  }, { downloadOnly: true });
+  assert.equal(result.paused.code, "result_unavailable");
+  assert.equal(state.jobs[0].status, "running");
+  assert.equal(retryFailedJobs(state), 0);
+  assert.deepEqual([state.jobs[0].requestId, state.jobs[0].generationId, state.jobs[0].idempotencyKey, state.jobs[0].attempt], original);
+});
+
+test("多图补收中断后立即保存已下载路径，再恢复不覆盖第一张", async () => {
+  const dir = workspace();
+  const state = createState({ kind: "batch", batchId: "partial-download", outDir: join(dir, "out"),
+    jobs: [{ sku: "S", slot: "image", model: "gpt-image-2.5-2K", n: 2, refs: [], prompt: "test" }] });
+  Object.assign(state.jobs[0], { status: "running", requestId: "old-request", generationId: "old-generation", idempotencyKey: "old-key" });
+  const counts = [0, 0];
+  const client = {
+    async queryJobs() { return { items: [{ job_id: "old-request", status: "succeeded", settled_credits: "0.08", billing_status: "settled",
+      media: [0, 1].map((i) => ({ type: "image", url: `https://oss.example.test/${i}`, content_type: "image/png" })) }], missing: [] }; },
+    async download(url, path) {
+      const i = Number(url.slice(-1));
+      counts[i] += 1;
+      if (i === 1 && counts[i] === 1) throw new Error("interrupted");
+      mkdirSync(join(path, ".."), { recursive: true });
+      writeFileSync(path, `image-${i}-pass-${counts[i]}`);
+    },
+  };
+  await runBatch(state, client, { downloadOnly: true });
+  const statePath = join(state.outDir, ".quriov", stateFiles(join(state.outDir, ".quriov"))[0]);
+  const saved = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.equal(saved.jobs[0].files.length, 1, "已完成图片须写入磁盘状态");
+  const first = saved.jobs[0].files[0];
+  const bytes = readFileSync(first, "hex");
+  await runBatch(saved, client, { downloadOnly: true });
+  assert.equal(saved.jobs[0].status, "done");
+  assert.deepEqual(counts, [1, 2]);
+  assert.equal(readFileSync(first, "hex"), bytes);
+  assert.equal(saved.jobs[0].requestId, "old-request");
 });
 
 test("resume --retry-failed：失败的换新编号重交，成功的不动", async () => {
