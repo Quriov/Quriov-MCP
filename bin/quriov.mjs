@@ -60,7 +60,7 @@ import {
   skillDirsFor,
   writeClientConfig,
 } from "../lib/setup.mjs";
-import { batchStatusCommand, batchSubmitCommand, jobsCommand } from "../lib/batch.mjs";
+import { batchStatusCommand, batchSubmitCommand, jobsCommand, queryJobsChunked } from "../lib/batch.mjs";
 import { aplusCommand } from "../lib/aplus.mjs";
 import {
   NO_UPDATE_CHECK_ENV,
@@ -97,8 +97,6 @@ export const DEFAULT_POLL_SECONDS = 15;
 export const MAX_IMAGES_PER_SUBMIT = 4;
 export const MAX_PROMPT_CHARS = 8000;
 const UPLOAD_REUSE_MARGIN_MS = 2 * 3600 * 1000; // 参考图链接 24 小时有效；剩不到 2 小时就重传
-const UNKNOWN_GIVE_UP_MS = 10 * 60 * 1000;
-const MISSING_GIVE_UP_POLLS = 8;
 const MAX_DOWNLOAD_ATTEMPTS = 3;
 const STATE_DIR = ".quriov";
 const TERMINAL_OK = new Set(["succeeded", "partial"]);
@@ -668,6 +666,12 @@ export function retryFailedJobs(state) {
   let count = 0;
   for (const job of state.jobs) {
     if (job.status !== "failed") continue;
+    // A recent-list miss is not a failed generation. Recover the original job,
+    // never turn it into a new paid submission with a new idempotency key.
+    if (job.errorCode === "lost_from_history" && (job.requestId || job.generationId)) {
+      job.status = "running";
+      continue;
+    }
     job.attempt += 1;
     Object.assign(job, {
       status: "pending",
@@ -700,6 +704,7 @@ export async function runBatch(state, client, {
   log = () => {},
   templateAspect = {},
   shouldStop = () => false,
+  downloadOnly = false,
 } = {}) {
   const save = () => {
     saveState(state);
@@ -708,6 +713,13 @@ export async function runBatch(state, client, {
   const total = state.jobs.length;
   let paused = null;
   let fatal = null;
+  if (!downloadOnly) {
+    for (const job of state.jobs) {
+      if (job.status === "failed" && job.errorCode === "lost_from_history" && (job.requestId || job.generationId)) {
+        job.status = "running";
+      }
+    }
+  }
   const label = (job) => `[${job.index + 1}/${total}] ${state.kind === "batch" ? `${job.sku} / ${job.slot}` : "出图"}`;
 
   const failJob = (job, code, message) => {
@@ -742,19 +754,36 @@ export async function runBatch(state, client, {
       return;
     }
     if (item.status === "unknown" || item.request_status === "unknown") {
-      if (job.submittedAt && now() - job.submittedAt > UNKNOWN_GIVE_UP_MS) {
-        failJob(job, "service_unavailable", "提交后 10 分钟服务端仍说不清结果（服务端临时故障）。已扣的点会按实际出图结算；可 --retry-failed 重交。");
-      }
+      paused = { code: "unknown", message: "原任务结果尚未确定，已保留编号并暂停；未重新提交。" };
+      log(`${label(job)} ${paused.message}`);
+      return;
+    }
+    if (item.status === "expired") {
+      paused = { code: "result_unavailable", message: "原任务记录已清理，结果当前不可下载；已保留编号并暂停，未重新提交。" };
+      log(`${label(job)} ${paused.message}`);
+      return;
+    }
+    if (item.status === "cancelled") {
+      failJob(job, item.error_code ?? "generation_failed", item.reason ?? "原任务已结束，结果当前不可下载。");
       return;
     }
     if (!TERMINAL_OK.has(item.status)) return; // 还在排队 / 生成中
     const media = (item.media ?? []).filter((m) => m && m.type === "image" && typeof m.url === "string");
+    if (!media.length) {
+      paused = { code: "result_unavailable", message: "原任务已成功但没有可下载图片，已保留编号并暂停；未重新提交。" };
+      log(`${label(job)} ${paused.message}`);
+      return;
+    }
     job.mediaCount = media.length;
     const targets = outputFiles(state, job, media.length, media.map((m) => m.content_type));
     const files = [];
     try {
       for (let i = 0; i < media.length; i += 1) {
-        await client.download(media[i].url, targets[i]);
+        if (!job.files.includes(targets[i]) || !existsSync(targets[i])) {
+          await client.download(media[i].url, targets[i]);
+        }
+        if (!job.files.includes(targets[i])) job.files.push(targets[i]);
+        saveState(state);
         files.push(targets[i]);
       }
     } catch (error) {
@@ -811,23 +840,31 @@ export async function runBatch(state, client, {
   };
 
   const poll = async () => {
-    const watching = state.jobs.filter((j) => j.status === "running" || j.status === "download_retry");
+    const watching = state.jobs.filter((j) => downloadOnly
+      ? (j.requestId || j.generationId) && !(j.status === "done" && j.files.length && j.files.every(existsSync))
+      : j.status === "running" || j.status === "download_retry");
     if (!watching.length) return;
-    const { items = [] } = await client.listGenerations();
+    const { items = [] } = await queryJobsChunked(client, watching.map((j) => j.requestId || j.generationId));
     const byId = new Map();
+    const byKey = new Map();
     for (const item of items) {
-      if (item.request_id) byId.set(item.request_id, item);
-      if (item.generation_id) byId.set(item.generation_id, item);
+      // The exact jobs API returns job_id and settled_credits. Keep the existing
+      // applyResult contract; never replace a generation ID with a request ID.
+      byId.set(item.job_id, { ...item, credits: item.settled_credits });
+      if (item.idempotency_key) byKey.set(item.idempotency_key, byId.get(item.job_id));
     }
     for (const job of watching) {
-      const item = byId.get(job.requestId) ?? (job.generationId ? byId.get(job.generationId) : undefined);
+      const item = byId.get(job.requestId) ?? (job.generationId ? byId.get(job.generationId) : undefined) ?? byKey.get(job.idempotencyKey);
       if (!item) {
         job.missingPolls += 1;
-        if (job.missingPolls >= MISSING_GIVE_UP_POLLS) failJob(job, "lost_from_history");
+        paused = { code: "not_found", message: "按原编号仍查不到任务，已保留编号并暂停；未重新提交。" };
+        log(`${label(job)} ${paused.message}`);
         continue;
       }
       job.missingPolls = 0;
+      if (!job.requestId) job.requestId = item.job_id;
       await applyResult(job, item);
+      if (job.status === "failed" && item.billing_status === "none") job.charged = false;
     }
     save();
   };
@@ -837,6 +874,10 @@ export async function runBatch(state, client, {
     state.jobs.find((j) => j.status === "submitting") ?? state.jobs.find((j) => j.status === "pending");
 
   try {
+    if (downloadOnly) {
+      await poll(); // One read/download pass. Never enter submission or replay.
+      return { paused, counts: statusCounts(state), costFile: join(state.outDir, state.costFile) };
+    }
     for (;;) {
       if (shouldStop()) break;
       while (!paused && !fatal && running() < concurrency && nextToSubmit() && !shouldStop()) {
@@ -858,6 +899,7 @@ export async function runBatch(state, client, {
       await sleep(pollSeconds * 1000);
       if (shouldStop()) break;
       await poll();
+      if (["not_found", "unknown", "result_unavailable"].includes(paused?.code)) break;
     }
   } finally {
     save();
@@ -958,6 +1000,7 @@ const BOOLEAN_FLAGS = Object.freeze({
   "--estimate": "estimate",
   "--json": "json",
   "--retry-failed": "retryFailed",
+  "--download-only": "downloadOnly",
   "--wait": "wait",
   "--no-wait": "noWait",
   "--all": "all",
@@ -1054,6 +1097,8 @@ export const HELP = `Quriov 官方命令行 ${VERSION} —— 和 Quriov MCP 同
   quriov batch status <批次号|输出目录> [--json]
   quriov batch resume <批次号|输出目录> [--retry-failed] [--yes]
                                  断了接着跑；已提交的用原任务编号，不会重复扣钱
+  quriov batch resume <批次号|输出目录> --download-only
+                                 仅精确查询旧任务并补下载，不提交待办、不重发、不花生成费用
 
 批量（整批交给服务端；条目里是参考图链接，适合 AI / 脚本）
   quriov batch submit <条目.jsonl|条目.json|-> [--dry-run] [--yes] [--batch-key <键>] [--json]
@@ -1240,6 +1285,9 @@ async function runCommand(argv, io = {}) {
   const log = (text) => stderr.write(`${text}\n`);
   const args = parseArgv(argv);
   const [command, sub, ...rest] = args.positional;
+  if (args.downloadOnly && (command !== "batch" || sub !== "resume" || args.retryFailed)) {
+    throw new CliError("usage", "--download-only 只用于 batch resume，不能与 --retry-failed 同用。", { exitCode: 2 });
+  }
 
   if (args.version) {
     print(VERSION);
@@ -1272,10 +1320,10 @@ async function runCommand(argv, io = {}) {
   });
 
   // 跑批：不管正常结束、暂停还是中途出错，都先把进度和续跑命令说清楚。
-  const execute = async (state, client, templateAspect) => {
+  const execute = async (state, client, templateAspect, options = {}) => {
     let result;
     try {
-      result = await runBatch(state, client, { ...runOptions(), templateAspect });
+      result = await runBatch(state, client, { ...runOptions(), templateAspect, ...options });
     } catch (error) {
       print(describeFinish(state, { paused: null, counts: statusCounts(state), costFile: join(state.outDir, state.costFile) }));
       throw error;
@@ -1669,6 +1717,12 @@ async function runCommand(argv, io = {}) {
 
     if (sub === "resume") {
       const state = findState(rest[0] ?? ".", where);
+      if (args.downloadOnly) {
+        print("只查询已提交任务并补下载；未提交的保持原样，不上传、不生成、不重发。");
+        const code = await execute(state, makeClient(), state.templateAspect ?? {}, { downloadOnly: true });
+        if (code) print(`继续只收旧结果：quriov batch resume ${state.batchId} --download-only`);
+        return code;
+      }
       const retried = args.retryFailed ? retryFailedJobs(state) : 0;
       if (!isUnfinishedState(state)) {
         print(describeFinish(state, { paused: null, counts: statusCounts(state), costFile: join(state.outDir, state.costFile) }));
