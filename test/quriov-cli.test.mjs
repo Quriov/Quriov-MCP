@@ -659,7 +659,7 @@ test("精确恢复按接口上限分块；真实失败保留，pending不动，�
   assert.equal(state.jobs[200].charged, false);
   assert.equal(state.jobs[201].status, "running", "成功却缺媒体不能报已下载");
   assert.equal(state.jobs[202].status, "pending");
-  assert.equal(result.paused.code, "result_unavailable");
+  assert.equal(result.paused.code, "reference_unavailable", "引用故障不能被随后缺媒体的结果覆盖");
 });
 
 test("记录清理仅暂停，不能被当作生成失败清编号后付费重试", async () => {
@@ -746,6 +746,55 @@ test("引用失败自动停新增：同步拒绝、抛错、轮询失败均保�
     assert.equal(state.jobs[2].attempt, 1);
     const saved = JSON.parse(readFileSync(join(state.outDir, ".quriov", stateFiles(join(state.outDir, ".quriov"))[0]), "utf8"));
     assert.equal(saved.pauseReason.code, "reference_unavailable");
+  }
+});
+
+test("只下载没有任务可查询时仍保留引用失败暂停，status不建议付费重试", async () => {
+  const dir = workspace();
+  const state = createState({ kind: "batch", batchId: "ref-stop-no-id", outDir: join(dir, "out"),
+    jobs: [{ sku: "S", slot: "image", model: "gpt-image-2.5-2K", n: 1, refs: [], prompt: "test" }] });
+  Object.assign(state.jobs[0], { status: "failed", errorCode: "invalid_media_reference", errorMessage: "旧提示：可以用 --retry-failed 直接重跑。" });
+  state.pauseReason = { code: "reference_unavailable", message: "参考图读取失败" };
+  await runBatch(state, {}, { downloadOnly: true });
+  assert.equal(state.pauseReason.code, "reference_unavailable");
+  const path = join(state.outDir, ".quriov", stateFiles(join(state.outDir, ".quriov"))[0]);
+  const saved = JSON.parse(readFileSync(path, "utf8"));
+  assert.equal(saved.pauseReason.code, "reference_unavailable");
+  const status = await run(["batch", "status", state.outDir], { dir });
+  assert.match(status.stdout, /--download-only/);
+  assert.doesNotMatch(status.stdout, /--retry-failed/);
+  const json = await run(["batch", "status", state.outDir, "--json"], { dir });
+  assert.doesNotMatch(json.stdout, /--retry-failed/);
+  const recovered = await run(["batch", "resume", state.outDir, "--download-only"], { dir });
+  assert.equal(recovered.code, 4);
+  assert.doesNotMatch(recovered.stdout, /--retry-failed/);
+  assert.doesNotMatch(readFileSync(join(state.outDir, "cost.csv"), "utf8"), /--retry-failed/);
+});
+
+test("引用失败之后的unknown、查不到、expired、缺媒体不覆盖暂停也不反复轮询", async () => {
+  for (const later of ["unknown", "missing", "expired", "no-media"]) {
+    const dir = workspace();
+    const state = createState({ kind: "batch", batchId: `ref-priority-${later}`, outDir: join(dir, "out"),
+      jobs: [0, 1, 2].map((i) => ({ sku: `S${i}`, slot: "image", model: "gpt-image-2.5-2K", n: 1, refs: [], prompt: "test" })) });
+    Object.assign(state.jobs[0], { status: "running", requestId: "old-running", generationId: "old-generation", idempotencyKey: "old-key" });
+    let queries = 0;
+    let submits = 0;
+    const result = await runBatch(state, {
+      async generateImage() { submits += 1; return { request_id: "ref-rejected", request_status: "failed", status: "failed", error_code: "media_fetch_failed" }; },
+      async queryJobs() {
+        assert.equal(++queries, 1, "遇unknown等情况须立即停止轮询");
+        return { items: later === "missing" ? [] : [{ job_id: "old-running", status: later === "no-media" ? "succeeded" : later, media: [] }], missing: [] };
+      },
+    }, { concurrency: 2, sleep: async () => {} });
+    assert.equal(result.paused.code, "reference_unavailable");
+    assert.equal(state.pauseReason.code, "reference_unavailable");
+    assert.equal(submits, 1);
+    assert.equal(queries, 1);
+    assert.deepEqual(state.jobs.map((j) => j.status), ["running", "failed", "pending"]);
+    assert.equal(state.jobs[0].requestId, "old-running");
+    const status = await run(["batch", "status", state.outDir], { dir });
+    assert.match(status.stdout, /--download-only/);
+    assert.doesNotMatch(status.stdout, /--retry-failed/);
   }
 });
 
