@@ -98,6 +98,7 @@ export const MAX_IMAGES_PER_SUBMIT = 4;
 export const MAX_PROMPT_CHARS = 8000;
 const UPLOAD_REUSE_MARGIN_MS = 2 * 3600 * 1000; // 参考图链接 24 小时有效；剩不到 2 小时就重传
 const MAX_DOWNLOAD_ATTEMPTS = 3;
+const REFERENCE_FAILURE_CODES = new Set(["media_fetch_failed", "invalid_media_reference"]);
 const STATE_DIR = ".quriov";
 const TERMINAL_OK = new Set(["succeeded", "partial"]);
 
@@ -581,7 +582,7 @@ const STATUS_LABELS = Object.freeze({
 });
 
 // 「没生成、没扣点」：服务端明确回了失败、而且没给 generation_id（比如取参考图失败 media_fetch_failed，
-// 还没开始生成）。服务端扣点一定挂在一次生成上，没有生成就没有扣点，所以这类可以直接重跑。
+// 还没开始生成）。无扣费不代表故障已解决，需先修复原因、核账后明确重试。
 // job.charged：false = 确定没扣点；null = 以服务端返回的点数（credits / billingStatus）为准。
 export function isNotCharged(job) {
   return job.charged === false;
@@ -598,7 +599,7 @@ export function settlementNote(jobs) {
   const parts = [];
   if (notCharged.length) {
     const reasons = [...new Set(notCharged.map((j) => NOT_CHARGED_REASONS[j.errorCode] ?? j.errorCode ?? "未知"))];
-    parts.push(`${notCharged.length} 条没生成、没扣点（原因：${reasons.join("、")}），可以直接重跑`);
+    parts.push(`${notCharged.length} 条没生成、没扣点（原因：${reasons.join("、")}），请先修复原因并核账，再明确重试`);
   }
   if (unsettled) parts.push(`${unsettled} 条已提交但服务端还没返回点数`);
   return parts.join("；");
@@ -622,7 +623,7 @@ export function renderCostCsv(state) {
         STATUS_LABELS[job.status] ?? job.status,
         job.files.map((f) => f.replace(`${state.outDir}`, ".").replace(/\\/g, "/")).join(" "),
         job.requestId ?? "",
-        job.errorMessage ?? "",
+        failureMessage(job) ?? "",
       ]
         .map(csvCell)
         .join(","),
@@ -707,11 +708,13 @@ export async function runBatch(state, client, {
   downloadOnly = false,
 } = {}) {
   const save = () => {
+    state.pauseReason = paused;
     saveState(state);
     writeCostCsv(state);
   };
   const total = state.jobs.length;
-  let paused = null;
+  let paused = downloadOnly && state.pauseReason?.code === "reference_unavailable" ? state.pauseReason : null;
+  let pollingBlocked = false;
   let fatal = null;
   if (!downloadOnly) {
     for (const job of state.jobs) {
@@ -721,11 +724,21 @@ export async function runBatch(state, client, {
     }
   }
   const label = (job) => `[${job.index + 1}/${total}] ${state.kind === "batch" ? `${job.sku} / ${job.slot}` : "出图"}`;
+  const pause = (job, reason) => {
+    if (["not_found", "unknown", "result_unavailable"].includes(reason.code)) pollingBlocked = true;
+    if (paused?.code !== "reference_unavailable") paused = reason;
+    log(`${label(job)} ${reason.message}`);
+  };
 
   const failJob = (job, code, message) => {
     job.status = "failed";
     job.errorCode = code;
     job.errorMessage = message ?? describeError(code);
+    if (REFERENCE_FAILURE_CODES.has(code)) {
+      job.errorMessage = failureMessage(job);
+      pause(job, { code: "reference_unavailable", requestId: job.requestId,
+        message: "参考图读取失败，已停止本轮后续提交；已在飞任务只收结果。请先修复引用并核账，不要直接重试失败任务" });
+    }
     log(`${label(job)} 失败：${job.errorMessage}`);
   };
 
@@ -754,13 +767,11 @@ export async function runBatch(state, client, {
       return;
     }
     if (item.status === "unknown" || item.request_status === "unknown") {
-      paused = { code: "unknown", message: "原任务结果尚未确定，已保留编号并暂停；未重新提交。" };
-      log(`${label(job)} ${paused.message}`);
+      pause(job, { code: "unknown", message: "原任务结果尚未确定，已保留编号并暂停；未重新提交。" });
       return;
     }
     if (item.status === "expired") {
-      paused = { code: "result_unavailable", message: "原任务记录已清理，结果当前不可下载；已保留编号并暂停，未重新提交。" };
-      log(`${label(job)} ${paused.message}`);
+      pause(job, { code: "result_unavailable", message: "原任务记录已清理，结果当前不可下载；已保留编号并暂停，未重新提交。" });
       return;
     }
     if (item.status === "cancelled") {
@@ -770,8 +781,7 @@ export async function runBatch(state, client, {
     if (!TERMINAL_OK.has(item.status)) return; // 还在排队 / 生成中
     const media = (item.media ?? []).filter((m) => m && m.type === "image" && typeof m.url === "string");
     if (!media.length) {
-      paused = { code: "result_unavailable", message: "原任务已成功但没有可下载图片，已保留编号并暂停；未重新提交。" };
-      log(`${label(job)} ${paused.message}`);
+      pause(job, { code: "result_unavailable", message: "原任务已成功但没有可下载图片，已保留编号并暂停；未重新提交。" });
       return;
     }
     job.mediaCount = media.length;
@@ -829,7 +839,8 @@ export async function runBatch(state, client, {
     try {
       result = await client.generateImage(job.args);
     } catch (error) {
-      if (error.fatal) throw error;
+      if (error.fatal && !REFERENCE_FAILURE_CODES.has(error.code)) throw error;
+      if (error.requestId) job.requestId = error.requestId;
       failJob(job, error.code, error.message);
       return;
     }
@@ -857,8 +868,7 @@ export async function runBatch(state, client, {
       const item = byId.get(job.requestId) ?? (job.generationId ? byId.get(job.generationId) : undefined) ?? byKey.get(job.idempotencyKey);
       if (!item) {
         job.missingPolls += 1;
-        paused = { code: "not_found", message: "按原编号仍查不到任务，已保留编号并暂停；未重新提交。" };
-        log(`${label(job)} ${paused.message}`);
+        pause(job, { code: "not_found", message: "按原编号仍查不到任务，已保留编号并暂停；未重新提交。" });
         continue;
       }
       job.missingPolls = 0;
@@ -899,7 +909,7 @@ export async function runBatch(state, client, {
       await sleep(pollSeconds * 1000);
       if (shouldStop()) break;
       await poll();
-      if (["not_found", "unknown", "result_unavailable"].includes(paused?.code)) break;
+      if (pollingBlocked) break;
     }
   } finally {
     save();
@@ -1215,17 +1225,31 @@ function describeFinish(state, result) {
   if (c.failed) {
     lines.push("失败的任务：");
     for (const job of state.jobs.filter((j) => j.status === "failed")) {
-      lines.push(`  ${job.sku ? `${job.sku} / ${job.slot}` : "出图"}：${job.errorMessage}`);
+      lines.push(`  ${job.sku ? `${job.sku} / ${job.slot}` : "出图"}：${failureMessage(job)}`);
     }
   }
   if (isUnfinishedState(state) || c.failed) {
-    lines.push(`接着跑：quriov batch resume ${state.batchId}${c.failed ? "（加 --retry-failed 重试失败的）" : ""}`);
+    if ((result.paused ?? state.pauseReason)?.code === "reference_unavailable" || hasReferenceFailure(state)) {
+      lines.push(`只收原结果：quriov batch resume ${state.batchId} --download-only（修复引用、核账后再明确恢复提交）`);
+    } else {
+      lines.push(`接着跑：quriov batch resume ${state.batchId}${c.failed ? "（加 --retry-failed 重试失败的）" : ""}`);
+    }
   }
   return lines.join("\n");
 }
 
 function isUnfinishedState(state) {
   return state.jobs.some((j) => ["pending", "submitting", "running", "download_retry"].includes(j.status));
+}
+
+function hasReferenceFailure(state) {
+  return state.jobs.some((job) => job.status === "failed" && REFERENCE_FAILURE_CODES.has(job.errorCode));
+}
+
+function failureMessage(job) {
+  return REFERENCE_FAILURE_CODES.has(job.errorCode)
+    ? "参考图没取到：服务端读取参考图失败；请先修复引用并核账，再明确恢复提交。"
+    : job.errorMessage;
 }
 
 function exitCodeFor(state, result) {
@@ -1699,7 +1723,7 @@ async function runCommand(argv, io = {}) {
       }
       if (!state) return batchStatusCommand(rest[0], args, { makeClient, print, log, sleep, now, shouldStop });
       if (args.json) {
-        print(JSON.stringify({ batchId: state.batchId, counts: statusCounts(state), credits: sumCredits(state.jobs.map((j) => j.credits)), pausedUntil: state.pausedUntil, jobs: state.jobs.map(({ args: _a, ...job }) => ({ ...job, charged: job.charged ?? null })) }));
+        print(JSON.stringify({ batchId: state.batchId, counts: statusCounts(state), credits: sumCredits(state.jobs.map((j) => j.credits)), pausedUntil: state.pausedUntil, pauseReason: state.pauseReason ?? null, jobs: state.jobs.map(({ args: _a, ...job }) => ({ ...job, errorMessage: failureMessage(job), charged: job.charged ?? null })) }));
         return 0;
       }
       const c = statusCounts(state);
@@ -1709,8 +1733,11 @@ async function runCommand(argv, io = {}) {
       print(`  已扣点数（服务端返回）合计 ${sumCredits(state.jobs.map((j) => j.credits))}；明细 ${join(state.outDir, state.costFile)}`);
       const statusNote = settlementNote(state.jobs);
       if (statusNote) print(`  ${statusNote}`);
-      for (const job of state.jobs.filter((j) => j.status === "failed")) print(`  失败 ${job.sku} / ${job.slot}：${job.errorMessage}`);
-      if (isUnfinishedState(state) || c.failed) print(`  接着跑：quriov batch resume ${state.batchId}${c.failed ? " [--retry-failed]" : ""}`);
+      for (const job of state.jobs.filter((j) => j.status === "failed")) print(`  失败 ${job.sku} / ${job.slot}：${failureMessage(job)}`);
+      if (state.pauseReason?.code === "reference_unavailable" || hasReferenceFailure(state)) {
+        print(`  已暂停：${state.pauseReason?.message ?? "参考图读取失败尚未处理；请先修复引用并核账，再明确恢复提交。"}`);
+        print(`  只收原结果：quriov batch resume ${state.batchId} --download-only`);
+      } else if (isUnfinishedState(state) || c.failed) print(`  接着跑：quriov batch resume ${state.batchId}${c.failed ? " [--retry-failed]" : ""}`);
       print("  （这是本机记录；要看服务端最新进度请运行 resume）");
       return 0;
     }
