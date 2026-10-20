@@ -437,7 +437,8 @@ export function statePathFor(outDir, batchId) {
   return join(outDir, STATE_DIR, `${batchId}.json`);
 }
 
-export function createState({ kind, batchId, specPath = null, specHash = null, outDir, jobs, now = Date.now() }) {
+export function createState({ kind, batchId, specPath = null, specHash = null, outDir, jobs, referenceMode = "url", now = Date.now() }) {
+  validateReferenceMode(referenceMode);
   return {
     version: 1,
     kind,
@@ -448,6 +449,7 @@ export function createState({ kind, batchId, specPath = null, specHash = null, o
     outDir: resolve(outDir),
     costFile: kind === "batch" ? "cost.csv" : `cost-${batchId}.csv`,
     uploads: {},
+    referenceMode,
     pausedUntil: null,
     jobs: jobs.map((job, index) => ({
       ...job,
@@ -476,7 +478,7 @@ export function createState({ kind, batchId, specPath = null, specHash = null, o
 export function saveState(state) {
   const file = statePathFor(state.outDir, state.batchId);
   mkdirSync(dirname(file), { recursive: true });
-  writeAtomic(file, `${JSON.stringify(state, null, 2)}\n`);
+  writeAtomic(file, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   return file;
 }
 
@@ -707,6 +709,34 @@ export async function runBatch(state, client, {
   shouldStop = () => false,
   downloadOnly = false,
 } = {}) {
+  const referenceMode = state.referenceMode ?? "url";
+  validateReferenceMode(referenceMode);
+  const makeArgs = (job, media) => {
+    const options = {};
+    const aspect = job.aspectRatio || (job.templateId ? templateAspect[job.templateId] : null);
+    if (aspect) options.aspect_ratio = aspect;
+    if (job.templateId) options.template_id = job.templateId;
+    if (job.n !== 1) options.batch_size = job.n;
+    return { model: job.model, prompt: job.prompt,
+      idempotency_key: `qcli-${state.batchId}-${job.index}-a${job.attempt}`,
+      ...(media.length ? { input_media: media } : {}),
+      ...(Object.keys(options).length ? { options } : {}) };
+  };
+  if (referenceMode === "inline" && !downloadOnly) {
+    const bindings = { ...(state.inlineReferenceHashes ?? {}) };
+    // Validate the entire pending plan before any paid submit. Encoded bytes are
+    // released per job; each actual submit reads one snapshot and checks binding.
+    for (const job of state.jobs.filter((j) => j.status === "pending")) {
+      const { media, hashes } = readInlineReferences(job.refs);
+      checkInlineArguments(makeArgs(job, media));
+      if (bindings[job.key] && JSON.stringify(bindings[job.key]) !== JSON.stringify(hashes)) {
+        throw new CliError("reference_changed", "参考文件与原批次SHA不符；未提交待办任务，请核对原计划。", { exitCode: 2 });
+      }
+      bindings[job.key] = hashes;
+    }
+    state.inlineReferenceHashes = bindings;
+    saveState(state);
+  }
   const save = () => {
     state.pauseReason = paused;
     saveState(state);
@@ -816,21 +846,21 @@ export async function runBatch(state, client, {
   const submit = async (job) => {
     const firstSend = job.status === "pending";
     if (firstSend) {
-      const urls = [];
-      for (const ref of job.refs) urls.push(await ensureUpload(ref));
-      const options = {};
-      const aspect = job.aspectRatio || (job.templateId ? templateAspect[job.templateId] : null);
-      if (aspect) options.aspect_ratio = aspect;
-      if (job.templateId) options.template_id = job.templateId;
-      if (job.n !== 1) options.batch_size = job.n;
-      job.idempotencyKey = `qcli-${state.batchId}-${job.index}-a${job.attempt}`;
-      job.args = {
-        model: job.model,
-        prompt: job.prompt,
-        idempotency_key: job.idempotencyKey,
-        ...(urls.length ? { input_media: urls.map((value) => ({ type: "image_url", value })) } : {}),
-        ...(Object.keys(options).length ? { options } : {}),
-      };
+      let media, referenceHashes;
+      if (referenceMode === "inline") {
+        ({ media, hashes: referenceHashes } = readInlineReferences(job.refs));
+        if (JSON.stringify(referenceHashes) !== JSON.stringify(state.inlineReferenceHashes[job.key])) {
+          throw new CliError("reference_changed", "参考文件在准备后发生变化；已停提交，请核对原计划。", { exitCode: 2 });
+        }
+      } else {
+        media = [];
+        for (const ref of job.refs) media.push({ type: "image_url", value: await ensureUpload(ref) });
+      }
+      const args = makeArgs(job, media);
+      if (referenceMode === "inline") checkInlineArguments(args);
+      job.idempotencyKey = args.idempotency_key;
+      job.args = args;
+      if (referenceMode === "inline") job.referenceHashes = referenceHashes;
       job.status = "submitting";
       saveState(state); // 先落盘再提交：崩在这之后，续跑会用同一个编号重交，服务端认出来、不重复扣钱
     }
@@ -965,6 +995,7 @@ export async function preflight(client, jobs, { withAccount = true } = {}) {
 // ---------------------------------------------------------------------------
 
 const FLAG_SPEC = Object.freeze({
+  "--reference-mode": "referenceMode",
   "-m": "model",
   "--model": "model",
   "-p": "prompt",
@@ -1068,6 +1099,37 @@ function intOption(value, name, { min, max, fallback }) {
   return n;
 }
 
+function readInlineReferences(refs) {
+  const media = [], hashes = [];
+  for (const file of refs) {
+    if (!IMAGE_EXTENSIONS[extname(file).toLowerCase()]) throw new CliError("unsupported_media_format", "内联参考图只接受 JPG / PNG / WebP。", { exitCode: 2 });
+    let bytes;
+    try { bytes = readFileSync(file); }
+    catch { throw new CliError("missing_reference", "读不到内联参考图；未提交此任务。", { exitCode: 2 }); }
+    if (!bytes.length || bytes.length > MAX_UPLOAD_BYTES) throw new CliError("media_too_large", "内联参考图为空或超过单图上限；未提交此任务。", { exitCode: 2 });
+    const magic = bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) ||
+      bytes.subarray(0, 3).equals(Buffer.from([255,216,255])) ||
+      (bytes.length >= 12 && bytes.subarray(0, 4).toString() === "RIFF" && bytes.subarray(8, 12).toString() === "WEBP");
+    if (!magic) throw new CliError("unsupported_media_format", "内联参考文件不是有效的 JPG / PNG / WebP 文件头；未提交此任务。", { exitCode: 2 });
+    media.push({ type: "image_base64", value: bytes.toString("base64") });
+    hashes.push({ file, sha256: sha256(bytes) });
+  }
+  return { media, hashes };
+}
+
+function checkInlineArguments(args) {
+  // Client policy: budget the COMPLETE UTF-8 JSON-RPC body, not just image bytes.
+  // This conservative small-group budget is not a claim about server limits.
+  const rpc = { jsonrpc: "2.0", id: "9".repeat(32), method: "tools/call", params: { name: "generate_image", arguments: args } };
+  if (Buffer.byteLength(JSON.stringify(rpc)) > MAX_UPLOAD_BYTES) {
+    throw new CliError("media_too_large", "内联整组参数太大；请核对后另建URL模式计划，未提交待办任务，不会自动换模式。", { exitCode: 2 });
+  }
+}
+
+function validateReferenceMode(value) {
+  if (!["url", "inline"].includes(value)) throw new CliError("usage", "--reference-mode 只接受 url 或 inline。", { exitCode: 2 });
+}
+
 export const HELP = `Quriov 官方命令行 ${VERSION} —— 和 Quriov MCP 同一把钥匙、同一个后端，适合批量出图。
 安装说明：${INSTALL_DOC_URL}
 
@@ -1097,11 +1159,14 @@ export const HELP = `Quriov 官方命令行 ${VERSION} —— 和 Quriov MCP 同
 单张 / 小批
   quriov gen -m <模型> -p "<提示词>" [--ref a.jpg --ref b.jpg] [-t <模板>] [-n 1-4]
              [--aspect 3:4] [-o ./out] [--dry-run] [--yes]
+             [--reference-mode url|inline] 默认 url；inline 直接传完整原图字节，省去上传后再取图。
+                                 inline 仅用于小图组，整次参数最多 10 MiB；不会压图或自动换模式。
 
 批量（一张表，每行一个商品）
   quriov batch plan <表.csv|文件夹> [-m <模型>] [--estimate]
                                  只列计划：不联网、不花钱；--estimate 联网估价（免费）
   quriov batch run  <表.csv|文件夹> -o ./out [-m <模型>] [--yes] [--concurrency 4]
+                                 [--reference-mode url|inline] 模式随新批次保存，resume 不能更换。
                                  先估价再确认；自动传参考图、提交、等结果、下载、
                                  写 out/cost.csv（每行点数都来自服务端返回）
   quriov batch status <批次号|输出目录> [--json]
@@ -1309,6 +1374,12 @@ async function runCommand(argv, io = {}) {
   const log = (text) => stderr.write(`${text}\n`);
   const args = parseArgv(argv);
   const [command, sub, ...rest] = args.positional;
+  if (args.referenceMode !== undefined) {
+    validateReferenceMode(args.referenceMode);
+    if (!(command === "gen" || (command === "batch" && ["plan", "run", "resume"].includes(sub)))) {
+      throw new CliError("usage", "--reference-mode 只用于 gen、batch plan/run/resume。", { exitCode: 2 });
+    }
+  }
   if (args.downloadOnly && (command !== "batch" || sub !== "resume" || args.retryFailed)) {
     throw new CliError("usage", "--download-only 只用于 batch resume，不能与 --retry-failed 同用。", { exitCode: 2 });
   }
@@ -1625,7 +1696,7 @@ async function runCommand(argv, io = {}) {
       print("没有提交。");
       return 1;
     }
-    const state = createState({ kind: "gen", batchId: newBatchId(now()), outDir, jobs, now: now() });
+    const state = createState({ kind: "gen", batchId: newBatchId(now()), outDir, jobs, referenceMode: args.referenceMode ?? "url", now: now() });
     saveState(state);
     rememberBatch(state, where);
     return execute(state, client, pre.templateAspect);
@@ -1698,6 +1769,7 @@ async function runCommand(argv, io = {}) {
         specHash: spec.specHash,
         outDir,
         jobs: spec.jobs,
+        referenceMode: args.referenceMode ?? "url",
         now: now(),
       });
       state.templateAspect = pre.templateAspect;
@@ -1744,6 +1816,9 @@ async function runCommand(argv, io = {}) {
 
     if (sub === "resume") {
       const state = findState(rest[0] ?? ".", where);
+      if (args.referenceMode !== undefined && args.referenceMode !== (state.referenceMode ?? "url")) {
+        throw new CliError("usage", "原批次参考图模式已固定；不能换模式续跑，请核账后另建计划。", { exitCode: 2 });
+      }
       if (args.downloadOnly) {
         print("只查询已提交任务并补下载；未提交的保持原样，不上传、不生成、不重发。");
         const code = await execute(state, makeClient(), state.templateAspect ?? {}, { downloadOnly: true });
