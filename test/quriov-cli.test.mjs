@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1510,4 +1511,90 @@ test("doctor：任何失败都给中文原因，不甩出看不懂的异常", as
   assert.equal(weird.code, 1);
   assert.match(weird.stdout, /\[没过\] MCP 连得上、核心工具齐全：命令行内部出错（TypeError）/);
   assert.doesNotMatch(weird.stdout, /boom|DoctorError/);
+});
+
+
+test("inline原图：不上传，逐图字节与SHA相同，状态私有且JSON不泄露base64", async () => {
+  const dir = workspace(), server = createServer(), out = join(dir, "inline-out");
+  writeFileSync(join(dir, "refs/a.png"), Buffer.from([137,80,78,71,13,10,26,10,1]));
+  const result = await run(["batch", "run", writeCsv(dir, TWO_BY_TWO), "-m", "gpt-image-2.5-2K", "-o", out, "--yes", "--reference-mode", "inline"], { dir, server });
+  assert.equal(result.error, null); assert.equal(result.code, 0); assert.equal(server.uploads, 0);
+  const path = join(out, ".quriov", stateFiles(join(out, ".quriov"))[0]);
+  const state = JSON.parse(readFileSync(path));
+  assert.equal(state.referenceMode, "inline");
+  // Windows does not expose POSIX owner/group mode bits; the byte/transport assertions still run.
+  if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o777, 0o600);
+  for (const job of state.jobs) for (let i = 0; i < job.refs.length; i++) {
+    const raw = readFileSync(job.refs[i]), encoded = job.args.input_media[i];
+    assert.equal(encoded.type, "image_base64");
+    assert.deepEqual(Buffer.from(encoded.value, "base64"), raw);
+    assert.equal(job.referenceHashes[i].sha256, createHash("sha256").update(raw).digest("hex"));
+  }
+  assert.equal(server.toolCalls("estimate_cost").length > 0, true);
+  const status = await run(["batch", "status", out, "--json"], { dir, server });
+  assert.ok(!status.stdout.includes(state.jobs[0].args.input_media[0].value));
+  assert.ok(!result.stdout.includes(state.jobs[0].args.input_media[0].value));
+});
+
+test("inline：整个待办组超限或格式错误时，任何生成之前拒绝且不降级URL", async () => {
+  for (const bad of ["group-size", "magic", "empty", "file-size"]) {
+    const dir = workspace(), server = createServer();
+    writeFileSync(join(dir, "refs/a.png"), Buffer.from([137,80,78,71,13,10,26,10,1]));
+    const bytes = bad === "group-size" ? Buffer.alloc(8 * 1024 * 1024, 1) : bad === "file-size" ? Buffer.alloc(10 * 1024 * 1024 + 1, 1) : bad === "empty" ? Buffer.alloc(0) : Buffer.from("not-an-image");
+    if (bytes.length > 2 && bad !== "magic") bytes.set([255,216,255]);
+    writeFileSync(join(dir, "refs/b.jpg"), bytes);
+    const r = await run(["batch", "run", writeCsv(dir, TWO_BY_TWO), "-m", "gpt-image-2.5-2K", "-o", join(dir, "out"), "--yes", "--reference-mode", "inline"], { dir, server });
+    assert.ok(r.error, bad); assert.equal(server.toolCalls("generate_image").length, 0, bad); assert.equal(server.uploads, 0, bad);
+  }
+});
+
+test("inline恢复：模式持久化、已提交args冻结、只下载不读已变参考图", async () => {
+  const dir = workspace(), server = createServer(), out = join(dir, "out");
+  writeFileSync(join(dir, "refs/a.png"), Buffer.from([137,80,78,71,13,10,26,10,1]));
+  await run(["batch", "run", writeCsv(dir, TWO_BY_TWO), "-m", "gpt-image-2.5-2K", "-o", out, "--yes", "--reference-mode", "inline", "--concurrency", "1"], { dir, server, shouldStop: () => server.generations.size >= 1 });
+  const path = join(out, ".quriov", stateFiles(join(out, ".quriov"))[0]);
+  const before = JSON.parse(readFileSync(path)), original = before.jobs[0].args;
+  const submits = server.toolCalls("generate_image").length;
+  writeFileSync(join(dir, "refs/a.png"), "changed-and-invalid");
+  const download = await run(["batch", "resume", out, "--download-only"], { dir, server });
+  assert.equal(download.error, null); assert.equal(download.code, 4);
+  let after = JSON.parse(readFileSync(path)); assert.deepEqual(after.jobs[0].args, original);
+  assert.equal(server.toolCalls("generate_image").length, submits); assert.equal(server.uploads, 0);
+  const mismatch = await run(["batch", "resume", out, "--reference-mode", "url", "--yes"], { dir });
+  assert.equal(mismatch.error.code, "usage");
+  const changed = await run(["batch", "resume", out, "--yes"], { dir, server });
+  assert.ok(changed.error); assert.equal(server.toolCalls("generate_image").length, submits);
+  after = JSON.parse(readFileSync(path)); assert.deepEqual(after.jobs[0].args, original);
+});
+
+test("inline恢复待办：合法图内容发生变化也拒绝，原SHA不改写", async () => {
+  const dir = workspace(), server = createServer(), out = join(dir, "out");
+  writeFileSync(join(dir, "refs/a.png"), Buffer.from([137,80,78,71,13,10,26,10,1]));
+  await run(["batch", "run", writeCsv(dir, TWO_BY_TWO), "-m", "gpt-image-2.5-2K", "-o", out, "--yes", "--reference-mode", "inline", "--concurrency", "1"], { dir, server, shouldStop: () => server.generations.size >= 1 });
+  const path = join(out, ".quriov", stateFiles(join(out, ".quriov"))[0]), before = readFileSync(path);
+  writeFileSync(join(dir, "refs/b.jpg"), Buffer.from([255,216,255,9]));
+  const r = await run(["batch", "resume", out, "--yes"], { dir, server });
+  assert.equal(r.error.code, "reference_changed");
+  assert.deepEqual(readFileSync(path), before); assert.equal(server.toolCalls("generate_image").length, 1);
+});
+
+test("reference-mode无效值或不支持命令在写文件和联网前拒绝", async () => {
+  const dir = workspace();
+  for (const argv of [["gen", "--reference-mode", "typo"], ["aplus", "run", "--reference-mode", "inline"], ["batch", "submit", "x", "--reference-mode", "inline"]]) {
+    const r = await run(argv, { dir }); assert.equal(r.error.code, "usage");
+  }
+});
+
+
+test("inline未知提交恢复用冻结字节和幂等键，不重新读取变化的文件", async () => {
+  const dir = workspace(), out = join(dir, "out"), original = { model: "gpt-image-2.5-2K", prompt: "原提示", idempotency_key: "frozen-key", input_media: [{ type: "image_base64", value: "original-frozen-content" }] };
+  const state = createState({ kind: "batch", batchId: "frozen-inline", outDir: out, referenceMode: "inline", jobs: [{ key: "A/image", sku: "A", slot: "image", model: original.model, n: 1, refs: [join(dir, "nonexistent.png")], prompt: original.prompt }] });
+  Object.assign(state.jobs[0], { status: "submitting", idempotencyKey: "frozen-key", args: original });
+  let submits = 0;
+  await runBatch(state, {
+    async generateImage(args) { submits++; assert.deepEqual(args, original); return { request_id: "old-request", generation_id: "old-generation", status: "succeeded", credits: "0.05", billing_status: "settled", media: [{ type: "image", url: "https://output.example.test/img.png" }] }; },
+    async download(_url, path) { mkdirSync(join(path, ".."), { recursive: true }); writeFileSync(path, "result"); },
+    async upload() { assert.fail("inline不能上传"); },
+  });
+  assert.equal(submits, 1); assert.equal(state.jobs[0].status, "done"); assert.equal(state.jobs[0].idempotencyKey, "frozen-key"); assert.deepEqual(state.jobs[0].args, original);
 });
