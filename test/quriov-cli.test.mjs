@@ -1013,9 +1013,9 @@ test("模型下架 / 写错：联网校验时就拦下并列出能用的", async
 });
 
 for (const [old, replacement] of [
-  ["gpt-image-2", "gpt-image-2.5-1K"],
-  ["gpt-image-2-2K", "gpt-image-2.5-2K"],
-  ["gpt-image-2-4K", "gpt-image-2.5-4K"],
+  ["gpt-image-2", "gpt-image-2.6-1K"],
+  ["gpt-image-2-2K", "gpt-image-2.6-2K"],
+  ["gpt-image-2-4K", "gpt-image-2.6-4K"],
 ]) {
   test(`已停用的 Image 2（${old}）：点名改用 ${replacement}，一张都不提交`, async () => {
     const dir = workspace();
@@ -1029,7 +1029,7 @@ for (const [old, replacement] of [
 
 test("服务端回 retired_model 时也有中文说明", async () => {
   const { describeError } = await import("../lib/common.mjs");
-  assert.match(describeError("retired_model"), /gpt-image-2-2K → gpt-image-2.5-2K/);
+  assert.match(describeError("retired_model"), /gpt-image-2-2K → gpt-image-2.6-2K/);
 });
 
 test("服务端拒绝某一个任务：只这一个失败，原因翻成中文，其余照跑", async () => {

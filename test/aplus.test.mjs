@@ -68,7 +68,7 @@ function createServer({ pollsUntilDone = 1, balance = "100", failModules = [], o
 
   const mcpTools = {
     list_capabilities: () => ({
-      models: ["gpt-image-2.5-1K", "gpt-image-2.5-2K", "gpt-image-2.5-4K"].map((id) => ({ id, display_name: id, modality: "image", pricing_unit: "call", available: true })),
+      models: ["gpt-image-2.6-1K", "gpt-image-2.5-1K", "gpt-image-2.5-2K", "gpt-image-2.5-4K"].map((id) => ({ id, display_name: id, modality: "image", pricing_unit: "call", available: true })),
       templates: [],
     }),
     estimate_cost: (args) => ({ model_id: args.model_id, pricing_unit: args.pricing_unit, units: String(args.units), credits: (Number(args.units) * PRICE).toFixed(2) }),
@@ -253,7 +253,7 @@ test("本机校验：模块数越界 / 重复、参考图不存在 / 太大 / �
     [["aplus", "run", "--modules", "aplus_lifestyle", "--ref", join(dir, "ref.png"), "--points-file", join(dir, "empty.txt")], /没有卖点/],
     [["aplus", "run", "--modules", "aplus_lifestyle", "--ref", join(dir, "ref.png"), "--points-file", join(dir, "missing.txt")], /读不到卖点文件/],
     [["aplus", "run", "--modules", "aplus_lifestyle", "--ref", join(dir, "ref.png"), "--point", "轻", "-m", "some-video-model"], /详情套图不能用型号 some-video-model/],
-    [["aplus", "run", "--modules", "aplus_lifestyle", "--ref", join(dir, "ref.png"), "--point", "轻", "-m", "gpt-image-2-2K"], /已停用，请改用同档的 gpt-image-2\.5-2K/],
+    [["aplus", "run", "--modules", "aplus_lifestyle", "--ref", join(dir, "ref.png"), "--point", "轻", "-m", "gpt-image-2-2K"], /已停用，请改用同档的 gpt-image-2\.6-2K/],
     [["aplus", "run", "--modules", "aplus_size_chart", "--ref", join(dir, "ref.png"), "--point", "轻"], /aplus_size_chart 要带真实尺码数据/],
   ];
   for (const [argv, pattern] of cases) {
@@ -304,7 +304,7 @@ test("--estimate：给出每个模块的单价、合计和余额；不发提交�
   assert.equal(human.error, null, String(human.error?.message));
   assert.equal(human.code, 0);
   assert.match(human.stdout, /4 个模块/);
-  assert.match(human.stdout, /gpt-image-2\.5-1K × 4 个模块（每个 0\.75 点）= 3\.00 点/);
+  assert.match(human.stdout, /gpt-image-2\.6-1K × 4 个模块（每个 0\.75 点）= 3\.00 点/);
   assert.match(human.stdout, /当前余额 100 点/);
   assert.match(human.stdout, /只估价：没有提交，没有花钱/);
   FOUR.forEach((id, i) => assert.match(human.stdout, new RegExp(`${i + 1}\\s+${id}`)));
@@ -367,7 +367,7 @@ test("run：module_ids / selling_points 是 JSON 数组字符串且顺序不变�
   const points = JSON.parse(fields.selling_points);
   assert.ok(Array.isArray(points) && points.every((p) => typeof p === "string"), "卖点必须是 JSON 字符串数组");
   assert.deepEqual(points, ["第一条：轻", '带"引号"和,逗号的卖点', "第三条"]);
-  assert.equal(fields.model_id, "gpt-image-2.5-1K");
+  assert.equal(fields.model_id, "gpt-image-2.6-1K");
   assert.equal(fields.product_description, "蓝牙耳机");
   assert.equal(fields.headline, "听得更久");
   assert.equal(fields.size_chart_data, undefined);
@@ -377,7 +377,7 @@ test("run：module_ids / selling_points 是 JSON 数组字符串且顺序不变�
 
   const jobId = [...server.jobs.keys()][0];
   assert.match(stdout, new RegExp(`任务编号 ${jobId}`));
-  assert.match(stdout, new RegExp(`任务 ${jobId}：成功（成功 4 / 失败 0，共 4 个模块），型号 gpt-image-2\\.5-1K`));
+  assert.match(stdout, new RegExp(`任务 ${jobId}：成功（成功 4 / 失败 0，共 4 个模块），型号 gpt-image-2\\.6-1K`));
   const files = readdirSync(join(dir, "out")).sort();
   assert.deepEqual(files, order.map((id, i) => `0${i + 1}-${id}.png`));
   order.forEach((id, i) => {
